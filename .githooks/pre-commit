@@ -1,0 +1,48 @@
+#!/bin/sh
+# Pre-commit hook: block accidental secret commits
+
+set -e
+
+# Files that should never be committed
+FORBIDDEN_FILES="\.env$ \.env\. \.dev\.vars$ \.key$ id_rsa id_dsa id_ecdsa id_ed25519 \.p12$ \.pfx$"
+
+# Patterns that indicate secrets
+SECRET_PATTERNS='sk-[a-zA-Z0-9]{20,} ghp_[a-zA-Z0-9]{36} glpat-[a-zA-Z0-9\-]{20,} AKIA[0-9A-Z]{16} [a-zA-Z0-9_-]*password[a-zA-Z0-9_-]*[=:][[:space:]]*[^[:space:]]{8,} [a-zA-Z0-9_-]*api[_-]?key[a-zA-Z0-9_-]*[=:][[:space:]]*["'\'']?[a-zA-Z0-9_-]{16,} Bearer[[:space:]]+[a-zA-Z0-9_-]{20,} PRIVATE[[:space:]]+KEY'
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$STAGED_FILES" ]; then
+  exit 0
+fi
+
+echo "[pre-commit] Scanning staged files for secrets..."
+
+# Check for forbidden files
+for file in $STAGED_FILES; do
+  for pattern in $FORBIDDEN_FILES; do
+    if echo "$file" | grep -qE "$pattern"; then
+      echo ""
+      echo "ERROR: Attempting to commit forbidden file: $file"
+      echo "This file may contain secrets. Add it to .gitignore if not already."
+      echo "To bypass: git commit --no-verify (use with extreme caution)"
+      exit 1
+    fi
+  done
+done
+
+# Check for secret patterns in staged content
+for pattern in $SECRET_PATTERNS; do
+  matches=$(git diff --cached --diff-filter=ACM -U0 | grep -iE "^\+.*$pattern" || true)
+  if [ -n "$matches" ]; then
+    echo ""
+    echo "ERROR: Potential secret detected in staged changes:"
+    echo "$matches" | head -5
+    echo ""
+    echo "If this is a false positive, review the match and use:"
+    echo "  git commit --no-verify"
+    exit 1
+  fi
+done
+
+echo "[pre-commit] No secrets detected."
+exit 0
