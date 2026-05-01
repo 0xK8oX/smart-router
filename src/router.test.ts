@@ -310,6 +310,167 @@ describe("routeRequest streaming", () => {
   });
 });
 
+describe("routeRequest context length and max_tokens", () => {
+  it("skips provider when estimated input exceeds context_length", async () => {
+    vi.mocked(getPlan).mockResolvedValue({
+      providers: [{
+        name: "limited-provider",
+        base_url: "https://api.example.com",
+        model: "gpt-4",
+        format: "openai",
+        timeout: 30,
+        api_key: "sk-test",
+        masked_key: "sk...test",
+        context_length: 10, // Very small limit
+      }],
+    });
+
+    const req: RouterRequest = {
+      body: { model: "auto", messages: [{ role: "user", content: "this is a long message that definitely exceeds ten tokens" }] },
+      clientFormat: "openai",
+      plan: "test-plan",
+      isStreaming: false,
+    };
+
+    const res = await routeRequest(req, makeEnv(), makeCtx());
+    expect(res.status).toBe(503);
+    const body = await res.json() as Record<string, unknown>;
+    expect((body.details as Array<Record<string, unknown>>)[0].message).toMatch(/Context exceeded/);
+  });
+
+  it("caps max_tokens to provider max_output_tokens when client sends higher", async () => {
+    vi.mocked(getPlan).mockResolvedValue({
+      providers: [{
+        name: "capped-provider",
+        base_url: "https://api.example.com",
+        model: "gpt-4",
+        format: "openai",
+        timeout: 30,
+        api_key: "sk-test",
+        masked_key: "sk...test",
+        max_output_tokens: 2048,
+      }],
+    });
+
+    vi.mocked(callProvider).mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { role: "assistant", content: "hi" } }],
+      usage: { prompt_tokens: 5, completion_tokens: 2 },
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    const req: RouterRequest = {
+      body: { model: "auto", messages: [{ role: "user", content: "hi" }], max_tokens: 8000 },
+      clientFormat: "openai",
+      plan: "test-plan",
+      isStreaming: false,
+    };
+
+    await routeRequest(req, makeEnv(), makeCtx());
+
+    const callBody = vi.mocked(callProvider).mock.calls[0][2];
+    const parsed = JSON.parse(callBody);
+    expect(parsed.max_tokens).toBe(2048);
+  });
+
+  it("sets max_tokens when client omits it and provider has max_output_tokens", async () => {
+    vi.mocked(getPlan).mockResolvedValue({
+      providers: [{
+        name: "default-cap-provider",
+        base_url: "https://api.example.com",
+        model: "gpt-4",
+        format: "openai",
+        timeout: 30,
+        api_key: "sk-test",
+        masked_key: "sk...test",
+        max_output_tokens: 4096,
+      }],
+    });
+
+    vi.mocked(callProvider).mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { role: "assistant", content: "hi" } }],
+      usage: { prompt_tokens: 5, completion_tokens: 2 },
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    const req: RouterRequest = {
+      body: { model: "auto", messages: [{ role: "user", content: "hi" }] }, // no max_tokens
+      clientFormat: "openai",
+      plan: "test-plan",
+      isStreaming: false,
+    };
+
+    await routeRequest(req, makeEnv(), makeCtx());
+
+    const callBody = vi.mocked(callProvider).mock.calls[0][2];
+    const parsed = JSON.parse(callBody);
+    expect(parsed.max_tokens).toBe(4096);
+  });
+
+  it("preserves client max_tokens when provider has no max_output_tokens (below global fallback)", async () => {
+    vi.mocked(getPlan).mockResolvedValue({
+      providers: [{
+        name: "unlimited-provider",
+        base_url: "https://api.example.com",
+        model: "gpt-4",
+        format: "openai",
+        timeout: 30,
+        api_key: "sk-test",
+        masked_key: "sk...test",
+        // no max_output_tokens
+      }],
+    });
+
+    vi.mocked(callProvider).mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { role: "assistant", content: "hi" } }],
+      usage: { prompt_tokens: 5, completion_tokens: 2 },
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    const req: RouterRequest = {
+      body: { model: "auto", messages: [{ role: "user", content: "hi" }], max_tokens: 32000 },
+      clientFormat: "openai",
+      plan: "test-plan",
+      isStreaming: false,
+    };
+
+    await routeRequest(req, makeEnv(), makeCtx());
+
+    const callBody = vi.mocked(callProvider).mock.calls[0][2];
+    const parsed = JSON.parse(callBody);
+    expect(parsed.max_tokens).toBe(32000);
+  });
+
+  it("injects global fallback max_tokens when provider has no max_output_tokens and client omits it", async () => {
+    vi.mocked(getPlan).mockResolvedValue({
+      providers: [{
+        name: "fallback-provider",
+        base_url: "https://api.example.com",
+        model: "gpt-4",
+        format: "openai",
+        timeout: 30,
+        api_key: "sk-test",
+        masked_key: "sk...test",
+        // no max_output_tokens
+      }],
+    });
+
+    vi.mocked(callProvider).mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { role: "assistant", content: "hi" } }],
+      usage: { prompt_tokens: 5, completion_tokens: 2 },
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    const req: RouterRequest = {
+      body: { model: "auto", messages: [{ role: "user", content: "hi" }] }, // no max_tokens
+      clientFormat: "openai",
+      plan: "test-plan",
+      isStreaming: false,
+    };
+
+    await routeRequest(req, makeEnv(), makeCtx());
+
+    const callBody = vi.mocked(callProvider).mock.calls[0][2];
+    const parsed = JSON.parse(callBody);
+    expect(parsed.max_tokens).toBe(65536);
+  });
+});
+
 describe("routeRequest non-streaming reasoning", () => {
   it("accepts anthropic response with reasoning/thinking but no text content", async () => {
     vi.mocked(getPlan).mockResolvedValue({
@@ -349,9 +510,10 @@ describe("routeRequest non-streaming reasoning", () => {
     // Should return 200, not 503 (all providers failed)
     expect(res.status).toBe(200);
     
-    const body = await res.json();
+    const body = await res.json() as Record<string, unknown>;
     // Should have reasoning in the response
-    expect(body.choices[0].message.reasoning).toBe("The user just said hi.");
+    const msg = (body.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>;
+    expect(msg.reasoning).toBe("The user just said hi.");
     
     // Should record success, not empty
     const statCall = [...vi.mocked(recordStat).mock.calls].reverse().find(

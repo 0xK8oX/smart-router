@@ -18,6 +18,35 @@ import {
 import { createAnthropicSseToOpenAiTranslator, createOpenAiSseToAnthropicTranslator, consumePassthroughStreamForStats, parseSseEvents, serializeSseEvents } from "./translation/streaming";
 import { recordStat, extractUsage, getWeeklyUsage } from "./stats";
 
+/** Global fallback for max output tokens when provider has no specific limit. */
+const DEFAULT_MAX_OUTPUT_TOKENS = 65536; // 64K
+
+/** Rough token estimator: counts characters in message contents, divides by 3.
+ *  Conservative for mixed English/CJK (Eng ~4 chars/token, CJK ~1 char/token).
+ */
+function estimateInputTokens(body: unknown): number {
+  if (!body || typeof body !== "object") return 0;
+  const b = body as Record<string, unknown>;
+  const messages = b.messages as Array<Record<string, unknown>> | undefined;
+  if (!Array.isArray(messages)) return 0;
+
+  let chars = 0;
+  for (const msg of messages) {
+    const content = msg.content;
+    if (typeof content === "string") {
+      chars += content.length;
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block && typeof block === "object" && typeof (block as Record<string, unknown>).text === "string") {
+          chars += ((block as Record<string, unknown>).text as string).length;
+        }
+      }
+    }
+  }
+  // Add overhead for message structure (~4 tokens per message)
+  return Math.ceil(chars / 3) + messages.length * 4;
+}
+
 function classifyFailureForLog(status: number, message: string): string {
   const msg = message.toLowerCase();
   if (status === 402 || msg.includes("quota") || msg.includes("credit") || msg.includes("billing")) return "quota";
@@ -192,6 +221,20 @@ export async function routeRequest(
     );
   }
 
+  // If model name matches a provider name, target that provider directly
+  // e.g. model="jason-kimi-debbie" -> use only that provider with its configured model
+  let targetProvider: ProviderConfig | undefined;
+  if (req.body && typeof req.body === "object" && typeof (req.body as Record<string, unknown>).model === "string") {
+    const model = (req.body as Record<string, unknown>).model as string;
+    if (model !== "auto" && !model.startsWith("auto-")) {
+      targetProvider = planConfig.providers.find((p) => p.name === model);
+      if (targetProvider) {
+        req.body = { ...req.body, model: targetProvider.model };
+        console.log(`[ROUTER] TARGET_PROVIDER: plan=${effectivePlan} provider=${targetProvider.name} model_override=${targetProvider.model}`);
+      }
+    }
+  }
+
   // 1a. Filter out providers that have exceeded their weekly quota
   const quotaErrors: Array<{ provider: string; status: number; message: string }> = [];
   const providersAfterQuota: typeof planConfig.providers = [];
@@ -222,7 +265,9 @@ export async function routeRequest(
   }
 
   // 1. Get healthy providers (from the quota-filtered list)
-  const healthyProviders = await getHealthyProviders(env, effectivePlan, providersAfterQuota);
+  const healthyProviders = targetProvider
+    ? [targetProvider]
+    : await getHealthyProviders(env, effectivePlan, providersAfterQuota);
   if (healthyProviders.length === 0) {
     return new Response(
       JSON.stringify({ error: "All providers in cooldown" }),
@@ -273,9 +318,28 @@ export async function routeRequest(
       continue;
     }
 
-    // Call provider
-    // Inject stream_options for OpenAI providers so usage is included in streaming responses
+    // Check context length limit
+    if (provider.context_length) {
+      const estimatedTokens = estimateInputTokens(req.body);
+      if (estimatedTokens > provider.context_length) {
+        console.log(`[ROUTER] CONTEXT_EXCEEDED: plan=${effectivePlan} provider=${provider.name} estimated=${estimatedTokens} limit=${provider.context_length}`);
+        fireStat({ provider: provider.name, model: provider.model, key_mask: provider.masked_key, status: "failure" });
+        errors.push({ provider: provider.name, status: 0, message: `Context exceeded: ${estimatedTokens} > ${provider.context_length}` });
+        continue;
+      }
+    }
+
+    // Inject max_tokens cap to prevent output truncation
     let requestBody = translatedReq.body;
+    const effectiveMaxOutput = provider.max_output_tokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+    const parsed = JSON.parse(requestBody);
+    const clientMax = typeof parsed.max_tokens === "number" ? parsed.max_tokens : undefined;
+    if (clientMax === undefined || clientMax > effectiveMaxOutput) {
+      parsed.max_tokens = effectiveMaxOutput;
+      requestBody = JSON.stringify(parsed);
+    }
+
+    // Inject stream_options for OpenAI providers so usage is included in streaming responses
     if (req.isStreaming && provider.format === "openai") {
       const parsed = JSON.parse(requestBody);
       parsed.stream_options = { ...(parsed.stream_options || {}), include_usage: true };

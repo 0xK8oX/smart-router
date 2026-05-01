@@ -190,7 +190,7 @@ describe("handleUpdatePlan", () => {
     const res = await handleUpdatePlan("test-plan", req, makeEnv());
 
     expect(res.status).toBe(400);
-    const body = await res.json();
+    const body = await res.json() as Record<string, unknown>;
     expect(body.error).toBe("Missing providers array");
   });
 
@@ -204,7 +204,7 @@ describe("handleUpdatePlan", () => {
     const res = await handleUpdatePlan("test-plan", req, makeEnv());
 
     expect(res.status).toBe(400);
-    const body = await res.json();
+    const body = await res.json() as Record<string, unknown>;
     expect(body.error).toBe("Invalid JSON body");
   });
 });

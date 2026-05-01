@@ -177,6 +177,20 @@
           "timeout": 60
         },
         {
+          "name": "jason-kimi",
+          "base_url": "https://api.kimi.com/coding/",
+          "model": "k2p6",
+          "format": "anthropic",
+          "timeout": 60
+        },
+        {
+          "name": "jason-kimi-debbie",
+          "base_url": "https://api.kimi.com/coding/",
+          "model": "k2p6",
+          "format": "anthropic",
+          "timeout": 60
+        },
+        {
           "name": "jason-volcengine",
           "base_url": "https://ark.cn-beijing.volces.com/api/coding",
           "model": "kimi-k2.6",
