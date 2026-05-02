@@ -8,6 +8,7 @@
 import type { ProviderHealth } from "./types";
 
 const STORAGE_KEY = "health_state_v2";
+const ALERT_KEY = "alert_state_v1";
 
 const CIRCUIT_RULES: Record<string, { threshold: number; cooldownMs: number }> = {
   auth: { threshold: 1, cooldownMs: 60 * 60 * 1000 },            // 1 hour
@@ -59,6 +60,7 @@ function makeHealthy(): ProviderHealth {
 export class HealthTracker implements DurableObject {
   private state: DurableObjectState;
   private health: Map<string, ProviderHealth> = new Map();
+  private lastAlertAt: Map<string, number> = new Map();
   private loaded: boolean = false;
 
   constructor(state: DurableObjectState) {
@@ -73,6 +75,12 @@ export class HealthTracker implements DurableObject {
         this.health.set(keyId, this.normalizeHealth(h));
       }
     }
+    const alerts = await this.state.storage.get<Record<string, number>>(ALERT_KEY);
+    if (alerts) {
+      for (const [plan, ts] of Object.entries(alerts)) {
+        this.lastAlertAt.set(plan, ts);
+      }
+    }
     this.loaded = true;
   }
 
@@ -82,6 +90,14 @@ export class HealthTracker implements DurableObject {
       obj[keyId] = h;
     }
     await this.state.storage.put(STORAGE_KEY, obj);
+  }
+
+  private async saveAlerts(): Promise<void> {
+    const obj: Record<string, number> = {};
+    for (const [plan, ts] of this.lastAlertAt.entries()) {
+      obj[plan] = ts;
+    }
+    await this.state.storage.put(ALERT_KEY, obj);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -161,6 +177,22 @@ export class HealthTracker implements DurableObject {
           cooldownUntil: h.cooldownUntil,
         }));
       return new Response(JSON.stringify({ providers: sorted }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (path === "/health/shouldAlert" && request.method === "POST") {
+      const body = (await request.json()) as { plan?: string; cooldownMs?: number };
+      const plan = body.plan ?? "default";
+      const cooldown = body.cooldownMs ?? 15 * 60 * 1000; // 15 min default
+      const last = this.lastAlertAt.get(plan) ?? 0;
+      const now = Date.now();
+      const send = now - last >= cooldown;
+      if (send) {
+        this.lastAlertAt.set(plan, now);
+        await this.saveAlerts();
+      }
+      return new Response(JSON.stringify({ send, lastAlertAt: last, nextAlertAt: last + cooldown }), {
         headers: { "Content-Type": "application/json" },
       });
     }

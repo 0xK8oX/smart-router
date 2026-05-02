@@ -17,6 +17,7 @@ import {
 } from "./translation";
 import { createAnthropicSseToOpenAiTranslator, createOpenAiSseToAnthropicTranslator, consumePassthroughStreamForStats, parseSseEvents, serializeSseEvents } from "./translation/streaming";
 import { recordStat, extractUsage, getWeeklyUsage } from "./stats";
+import { shouldSendAlert, sendOutageAlert } from "./alerts";
 
 /** Global fallback for max output tokens when provider has no specific limit. */
 const DEFAULT_MAX_OUTPUT_TOKENS = 65536; // 64K
@@ -533,6 +534,18 @@ export async function routeRequest(
 
   // All providers failed (combine routing errors + quota errors)
   const allErrors = [...quotaErrors, ...errors];
+  console.log(`[ROUTER] ALL_PROVIDERS_FAILED: plan=${effectivePlan} errors=${allErrors.length}`);
+
+  // Fire outage alert asynchronously — don't block the response
+  ctx.waitUntil(
+    (async () => {
+      const send = await shouldSendAlert(env, effectivePlan);
+      if (send) {
+        await sendOutageAlert(env, effectivePlan, allErrors);
+      }
+    })()
+  );
+
   return new Response(
     JSON.stringify({
       error: "All providers failed",

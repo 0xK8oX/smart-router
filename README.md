@@ -52,16 +52,43 @@ Create the D1 database:
 npx wrangler d1 create smart-router-db
 ```
 
-### 3. Set the encryption key
+### 3. Set secrets
+
+All sensitive values are kept in Wrangler secrets (production) or `.dev.vars` (local dev). Never commit them.
+
+#### Required secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `KEY_ENCRYPTION_KEY` | 32-byte base64 master key for AES-256-GCM encryption of API keys in D1 |
+| `ADMIN_KEY` | Optional. Required to view decrypted keys via `GET /v1/plans` |
+| `TELEGRAM_BOT_TOKEN` | Optional. Telegram bot token for outage alerts |
+| `TELEGRAM_CHAT_ID` | Optional. Telegram chat ID for outage alerts |
+
+Generate the encryption key once:
 
 ```bash
-# Generate a 32-byte base64 key
 node -e "console.log(Buffer.from(crypto.randomBytes(32)).toString('base64'))"
-
-npx wrangler secret put KEY_ENCRYPTION_KEY
 ```
 
-This master key encrypts all provider API keys stored in D1. It never leaves Wrangler secrets.
+**Production:**
+```bash
+npx wrangler secret put KEY_ENCRYPTION_KEY
+npx wrangler secret put ADMIN_KEY
+npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put TELEGRAM_CHAT_ID
+```
+
+**Local dev:** create `.dev.vars` in the project root:
+
+```bash
+KEY_ENCRYPTION_KEY=your-32-byte-base64-key
+ADMIN_KEY=your-admin-key
+TELEGRAM_BOT_TOKEN=your-bot-token
+TELEGRAM_CHAT_ID=your-chat-id
+```
+
+> **Important:** Wrangler `dev` only reads `.dev.vars` — not `.env`. If `KEY_ENCRYPTION_KEY` is missing, API key decryption fails and every provider returns "Missing API key".
 
 ### 4. Deploy
 
@@ -126,11 +153,22 @@ See [API.md](API.md) for full endpoint documentation.
 
 ## Local Development
 
+### Wrangler dev (direct)
+
 ```bash
 npx wrangler dev --port 8790
 ```
 
-Test:
+### PM2 (auto-restart on crash)
+
+```bash
+pm2 start ecosystem.config.cjs
+pm2 logs smart-router
+```
+
+Make sure `.dev.vars` exists with `KEY_ENCRYPTION_KEY` before starting. Wrangler only reads `.dev.vars`, not `.env`.
+
+### Test request
 
 ```bash
 curl -X POST http://localhost:8790/v1/chat/completions \

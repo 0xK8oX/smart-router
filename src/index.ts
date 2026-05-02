@@ -117,6 +117,11 @@ export default {
       return handleChatRequest(request, env, "anthropic", ctx);
     }
 
+    // ── Status ───────────────────────────────────────────────────────────
+    if (path === "/v1/status" && request.method === "GET") {
+      return handleStatus(env);
+    }
+
     // ── Stats ────────────────────────────────────────────────────────────
     if (path === "/v1/stats" && request.method === "GET") {
       return handleQueryStats(url, env);
@@ -274,6 +279,113 @@ async function handleAggregateStats(url: URL, env: Env): Promise<Response> {
   return new Response(JSON.stringify({ group_by: groupBy, results }), {
     headers: { ...corsHeaders(), "Content-Type": "application/json" },
   });
+}
+
+async function handleStatus(env: Env): Promise<Response> {
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+
+  // 1. Get all plans
+  const plans = await listPlans(env.DB);
+
+  // 2. Get global health state from DO
+  const id = env.HEALTH_TRACKER.idFromName("global");
+  const stub = env.HEALTH_TRACKER.get(id);
+  const healthRes = await stub.fetch("https://fake-host/health/state");
+  const healthState = (await healthRes.json()) as Record<string, {
+    status: string;
+    consecutiveFailures: number;
+    lastFailureAt: number;
+    cooldownUntil: number;
+    lastFailureReason: string;
+    lastSuccessAt: number;
+    totalRequests: number;
+    successCount: number;
+    lastActivityAt: number;
+  }>;
+
+  // 3. Get per-plan stats for last hour
+  const statsRows = await queryStats(env.DB, { from: oneHourAgo, limit: 1000 });
+  const planStats = new Map<string, { requests: number; successes: number; totalTokens: number }>();
+  for (const row of statsRows as Array<Record<string, unknown>>) {
+    const plan = String(row.plan);
+    if (!planStats.has(plan)) {
+      planStats.set(plan, { requests: 0, successes: 0, totalTokens: 0 });
+    }
+    const s = planStats.get(plan)!;
+    s.requests++;
+    s.totalTokens += Number(row.total_tokens ?? 0);
+    if (row.status === "success") s.successes++;
+  }
+
+  // 4. Build per-plan overview
+  const planOverviews: Record<string, unknown> = {};
+  for (const [slug, config] of Object.entries(plans)) {
+    const providers: Array<Record<string, unknown>> = [];
+    let healthyCount = 0;
+    let firstAvailable: string | null = null;
+    const unhealthy: string[] = [];
+
+    for (const p of config.providers) {
+      const keyId = p.masked_key ?? p.name;
+      const health = healthState[keyId];
+      const isHealthy = health ? health.status === "healthy" : true;
+      const providerInfo: Record<string, unknown> = {
+        name: p.name,
+        model: p.model,
+        healthy: isHealthy,
+      };
+      if (health) {
+        providerInfo.status = health.status;
+        providerInfo.totalRequests = health.totalRequests;
+        providerInfo.successCount = health.successCount;
+        providerInfo.lastFailureReason = health.lastFailureReason || undefined;
+      }
+      providers.push(providerInfo);
+
+      if (isHealthy) {
+        healthyCount++;
+        if (!firstAvailable) firstAvailable = p.name;
+      } else {
+        unhealthy.push(p.name);
+      }
+    }
+
+    const stats = planStats.get(slug) ?? { requests: 0, successes: 0, totalTokens: 0 };
+    const successRate = stats.requests > 0 ? `${Math.round((stats.successes / stats.requests) * 100)}%` : "N/A";
+
+    planOverviews[slug] = {
+      providers: providers.length,
+      healthy: healthyCount,
+      first_available: firstAvailable,
+      unhealthy: unhealthy.length > 0 ? unhealthy : undefined,
+      requests_1h: stats.requests,
+      success_rate_1h: successRate,
+      total_tokens_1h: stats.totalTokens,
+      provider_details: providers,
+    };
+  }
+
+  // 5. System summary
+  const allProviders = Object.values(plans).flatMap((c) => c.providers);
+  const totalHealthy = allProviders.filter((p) => {
+    const h = healthState[p.masked_key ?? p.name];
+    return h ? h.status === "healthy" : true;
+  }).length;
+
+  const summary = {
+    total_plans: Object.keys(plans).length,
+    total_providers: allProviders.length,
+    healthy_providers: totalHealthy,
+    unhealthy_providers: allProviders.length - totalHealthy,
+    plans_with_outages: Object.entries(planOverviews)
+      .filter(([, v]) => (v as Record<string, unknown>).healthy === 0)
+      .map(([k]) => k),
+  };
+
+  return new Response(
+    JSON.stringify({ summary, plans: planOverviews }, null, 2),
+    { headers: { ...corsHeaders(), "Content-Type": "application/json" } }
+  );
 }
 
 function parseTimeParam(value: string | null): number | undefined {
