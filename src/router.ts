@@ -22,6 +22,20 @@ import { shouldSendAlert, sendOutageAlert } from "./alerts";
 /** Global fallback for max output tokens when provider has no specific limit. */
 const DEFAULT_MAX_OUTPUT_TOKENS = 65536; // 64K
 
+/** Max depth for virtual provider recursion to prevent infinite loops */
+const MAX_VIRTUAL_DEPTH = 3;
+
+/** Virtual provider URL prefix */
+const VIRTUAL_PREFIX = "smart://";
+
+function isVirtualProvider(baseUrl: string): boolean {
+  return baseUrl.startsWith(VIRTUAL_PREFIX);
+}
+
+function extractPlanFromUrl(baseUrl: string): string {
+  return baseUrl.slice(VIRTUAL_PREFIX.length);
+}
+
 /** Rough token estimator: counts characters in message contents, divides by 3.
  *  Conservative for mixed English/CJK (Eng ~4 chars/token, CJK ~1 char/token).
  */
@@ -200,7 +214,8 @@ async function reportSuccess(
 export async function routeRequest(
   req: RouterRequest,
   env: Env,
-  ctx: ExecutionContext
+  ctx: ExecutionContext,
+  depth: number = 0
 ): Promise<Response> {
   const startTime = Date.now();
 
@@ -298,6 +313,50 @@ export async function routeRequest(
   // 2. Try each healthy provider
   for (const provider of healthyProviders) {
     const apiKey = provider.api_key;
+
+    // Handle virtual providers (internal plan redirects)
+    if (isVirtualProvider(provider.base_url)) {
+      if (depth >= MAX_VIRTUAL_DEPTH) {
+        console.log(`[ROUTER] MAX_DEPTH_EXCEEDED: plan=${effectivePlan} provider=${provider.name} depth=${depth}`);
+        fireStat({ provider: provider.name, model: provider.model, key_mask: provider.masked_key, status: "failure" });
+        errors.push({ provider: provider.name, status: 0, message: "Max routing depth exceeded" });
+        continue;
+      }
+
+      const targetPlan = extractPlanFromUrl(provider.base_url);
+      console.log(`[ROUTER] VIRTUAL_PROVIDER: plan=${effectivePlan} provider=${provider.name} -> plan=${targetPlan} depth=${depth}`);
+
+      const virtualReq: RouterRequest = {
+        body: req.body,
+        clientFormat: req.clientFormat,
+        plan: targetPlan,
+        isStreaming: req.isStreaming,
+      };
+
+      const virtualRes = await routeRequest(virtualReq, env, ctx, depth + 1);
+
+      if (virtualRes.ok) {
+        console.log(`[ROUTER] VIRTUAL_SUCCESS: plan=${effectivePlan} provider=${provider.name} -> plan=${targetPlan}`);
+        return virtualRes;
+      }
+
+      // Virtual provider failed - collect errors and continue to next provider
+      let errorBody: unknown;
+      try {
+        errorBody = await virtualRes.clone().json();
+      } catch {
+        errorBody = { error: "Virtual provider failed" };
+      }
+      const virtualErrors = (errorBody as { details?: Array<{ provider: string; status: number; message: string }> })?.details ?? [];
+      for (const e of virtualErrors) {
+        errors.push({ provider: `${provider.name}:${e.provider}`, status: e.status, message: e.message });
+      }
+      if (virtualErrors.length === 0) {
+        errors.push({ provider: provider.name, status: 0, message: "Virtual provider failed" });
+      }
+      continue;
+    }
+
     if (!apiKey) {
       console.log(`[ROUTER] MISSING_API_KEY: plan=${effectivePlan} provider=${provider.name}`);
       fireStat({ provider: provider.name, model: provider.model, key_mask: provider.masked_key, status: "failure" });

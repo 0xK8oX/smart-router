@@ -506,19 +506,235 @@ describe("routeRequest non-streaming reasoning", () => {
     };
 
     const res = await routeRequest(req, makeEnv(), makeCtx());
-    
+
     // Should return 200, not 503 (all providers failed)
     expect(res.status).toBe(200);
-    
+
     const body = await res.json() as Record<string, unknown>;
     // Should have reasoning in the response
     const msg = (body.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>;
     expect(msg.reasoning).toBe("The user just said hi.");
-    
+
     // Should record success, not empty
     const statCall = [...vi.mocked(recordStat).mock.calls].reverse().find(
       (c) => (c[1] as { status: string }).status === "success"
     );
     expect(statCall).toBeDefined();
+  });
+});
+
+describe("routeRequest virtual providers", () => {
+  function makeOpenAiResponse(content: string): Response {
+    return new Response(JSON.stringify({
+      choices: [{ message: { role: "assistant", content } }],
+      usage: { prompt_tokens: 5, completion_tokens: 3 },
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+
+  function mockGetPlanForVirtualRouting(): void {
+    // Reset mock and set up for all virtual provider tests
+    vi.mocked(getPlan).mockReset();
+    vi.mocked(getPlan)
+      .mockImplementation(async (env: Env, plan: string) => {
+        if (plan === "primary") {
+          return {
+            providers: [{
+              name: "auto-fallback",
+              base_url: "smart://fallback",
+              model: "auto",
+              format: "anthropic",
+              timeout: 60,
+            }],
+          };
+        }
+        if (plan === "fallback") {
+          return {
+            providers: [{
+              name: "real-provider",
+              base_url: "https://api.example.com",
+              model: "gpt-4",
+              format: "openai",
+              timeout: 30,
+              api_key: "sk-test",
+              masked_key: "sk...test",
+            }],
+          };
+        }
+        return null;
+      });
+  }
+
+  it("routes to target plan when virtual provider is encountered", async () => {
+    mockGetPlanForVirtualRouting();
+
+    // Mock for the fallback plan - returns OpenAI format for OpenAI provider
+    vi.mocked(callProvider).mockReset();
+    vi.mocked(callProvider).mockResolvedValue(makeOpenAiResponse("fallback response"));
+
+    const req: RouterRequest = {
+      body: { model: "auto", messages: [{ role: "user", content: "hi" }] },
+      clientFormat: "openai",
+      plan: "primary",
+      isStreaming: false,
+    };
+
+    const res = await routeRequest(req, makeEnv(), makeCtx());
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    const msg = (body.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>;
+    expect(msg.content).toBe("fallback response");
+  });
+
+  it("returns 503 when target plan is not found", async () => {
+    vi.mocked(getPlan).mockReset();
+    vi.mocked(getPlan).mockResolvedValue({
+      providers: [{
+        name: "auto-fallback",
+        base_url: "smart://nonexistent",
+        model: "auto",
+        format: "anthropic",
+        timeout: 60,
+      }],
+    });
+
+    const req: RouterRequest = {
+      body: { model: "auto", messages: [{ role: "user", content: "hi" }] },
+      clientFormat: "openai",
+      plan: "primary",
+      isStreaming: false,
+    };
+
+    const res = await routeRequest(req, makeEnv(), makeCtx());
+
+    expect(res.status).toBe(503);
+  });
+
+  it("continues to next provider when virtual provider fails", async () => {
+    vi.mocked(getPlan).mockReset();
+    vi.mocked(getPlan)
+      .mockImplementation(async (env: Env, plan: string) => {
+        if (plan === "primary") {
+          return {
+            providers: [
+              {
+                name: "broken-virtual",
+                base_url: "smart://empty-plan",
+                model: "auto",
+                format: "anthropic",
+                timeout: 60,
+              },
+              {
+                name: "real-provider",
+                base_url: "https://api.example.com",
+                model: "gpt-4",
+                format: "openai",
+                timeout: 30,
+                api_key: "sk-test",
+                masked_key: "sk...test",
+              },
+            ],
+          };
+        }
+        // empty-plan returns empty array - this will cause the virtual provider to fail
+        if (plan === "empty-plan") {
+          return { providers: [] };
+        }
+        return null;
+      });
+
+    vi.mocked(callProvider).mockReset();
+    vi.mocked(callProvider).mockResolvedValue(makeOpenAiResponse("direct response"));
+
+    const req: RouterRequest = {
+      body: { model: "auto", messages: [{ role: "user", content: "hi" }] },
+      clientFormat: "openai",
+      plan: "primary",
+      isStreaming: false,
+    };
+
+    const res = await routeRequest(req, makeEnv(), makeCtx());
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    const msg = (body.choices as Array<Record<string, unknown>>)[0].message as Record<string, unknown>;
+    expect(msg.content).toBe("direct response");
+  });
+
+  it("returns 503 when max depth is exceeded in cycle", async () => {
+    vi.mocked(getPlan).mockReset();
+    vi.mocked(getPlan)
+      .mockImplementation(async (env: Env, plan: string) => {
+        if (plan === "a") {
+          return {
+            providers: [{
+              name: "b",
+              base_url: "smart://b",
+              model: "auto",
+              format: "anthropic",
+              timeout: 60,
+            }],
+          };
+        }
+        if (plan === "b") {
+          return {
+            providers: [{
+              name: "c",
+              base_url: "smart://c",
+              model: "auto",
+              format: "anthropic",
+              timeout: 60,
+            }],
+          };
+        }
+        if (plan === "c") {
+          return {
+            providers: [{
+              name: "d",
+              base_url: "smart://d",
+              model: "auto",
+              format: "anthropic",
+              timeout: 60,
+            }],
+          };
+        }
+        if (plan === "d") {
+          return {
+            providers: [{
+              name: "e",
+              base_url: "smart://e",
+              model: "auto",
+              format: "anthropic",
+              timeout: 60,
+            }],
+          };
+        }
+        if (plan === "e") {
+          return {
+            providers: [{
+              name: "f",
+              base_url: "smart://f",
+              model: "auto",
+              format: "anthropic",
+              timeout: 60,
+            }],
+          };
+        }
+        if (plan === "f") {
+          return { providers: [] };
+        }
+        return null;
+      });
+
+    const req: RouterRequest = {
+      body: { model: "auto", messages: [{ role: "user", content: "hi" }] },
+      clientFormat: "openai",
+      plan: "a",
+      isStreaming: false,
+    };
+
+    const res = await routeRequest(req, makeEnv(), makeCtx());
+
+    expect(res.status).toBe(503);
   });
 });

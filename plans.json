@@ -109,9 +109,9 @@
           "timeout": 60
         },
         {
-          "name": "zaipu",
-          "base_url": "https://open.bigmodel.cn/api/anthropic",
-          "model": "glm-5.1",
+          "name": "auto-chat2api",
+          "base_url": "smart://chat2api",
+          "model": "auto",
           "format": "anthropic",
           "timeout": 60
         }

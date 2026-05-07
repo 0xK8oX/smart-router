@@ -65,6 +65,8 @@ export interface StatRecord {
   status: "success" | "failure" | "empty" | "timeout";
   latency_ms: number;
   is_streaming: boolean;
+  /** For virtual providers: the actual provider in the target plan that served the request */
+  target_provider?: string;
 }
 
 export interface AggregateOptions {
