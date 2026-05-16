@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 
 	_ "modernc.org/sqlite"
@@ -143,6 +144,41 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 	}
 
 	return results, nil
+}
+
+func (d *DB) SavePlan(slug string, config types.PlanConfig) error {
+	data, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("marshal plan config: %w", err)
+	}
+
+	_, err = d.conn.Exec(`
+		INSERT INTO plans (slug, config)
+		VALUES (?, ?)
+		ON CONFLICT(slug) DO UPDATE SET config = excluded.config
+	`, slug, string(data))
+
+	if err != nil {
+		return fmt.Errorf("save plan: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) GetPlan(slug string) (*types.PlanConfig, error) {
+	var configJSON string
+	err := d.conn.QueryRow(`SELECT config FROM plans WHERE slug = ?`, slug).Scan(&configJSON)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("plan not found: %s", slug)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get plan: %w", err)
+	}
+
+	var config types.PlanConfig
+	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		return nil, fmt.Errorf("unmarshal plan config: %w", err)
+	}
+	return &config, nil
 }
 
 func (d *DB) Close() error {
