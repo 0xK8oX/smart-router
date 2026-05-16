@@ -18,10 +18,6 @@ type PlanConfig struct {
 	Providers []ProviderConfig `json:"providers" yaml:"providers"`
 }
 
-type PlansConfig struct {
-	Plans map[string]PlanConfig `yaml:"plans"`
-}
-
 type ProviderHealth struct {
 	Status              string `json:"status"`
 	ConsecutiveFailures int    `json:"consecutiveFailures"`
