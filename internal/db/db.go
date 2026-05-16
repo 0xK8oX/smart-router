@@ -181,6 +181,42 @@ func (d *DB) GetPlan(slug string) (*types.PlanConfig, error) {
 	return &config, nil
 }
 
+func (d *DB) ListPlans() (map[string]types.PlanConfig, error) {
+	rows, err := d.conn.Query(`SELECT slug, config FROM plans`)
+	if err != nil {
+		return nil, fmt.Errorf("list plans: %w", err)
+	}
+	defer rows.Close()
+
+	plans := make(map[string]types.PlanConfig)
+	for rows.Next() {
+		var slug string
+		var configJSON string
+		if err := rows.Scan(&slug, &configJSON); err != nil {
+			return nil, fmt.Errorf("scan plan: %w", err)
+		}
+		var config types.PlanConfig
+		if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+			return nil, fmt.Errorf("unmarshal plan config: %w", err)
+		}
+		plans[slug] = config
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	return plans, nil
+}
+
+func (d *DB) DeletePlan(slug string) error {
+	_, err := d.conn.Exec(`DELETE FROM plans WHERE slug = ?`, slug)
+	if err != nil {
+		return fmt.Errorf("delete plan: %w", err)
+	}
+	return nil
+}
+
 func (d *DB) Close() error {
 	return d.conn.Close()
 }
