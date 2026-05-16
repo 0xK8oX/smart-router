@@ -1,21 +1,21 @@
 package types
 
 type ProviderConfig struct {
-	Name              string  `json:"name"`
-	BaseURL           string  `json:"base_url"`
-	Model             string  `json:"model"`
-	Format            string  `json:"format"`
-	Timeout           int     `json:"timeout"`
-	APIKey            string  `json:"api_key,omitempty"`
-	MaskedKey         string  `json:"masked_key,omitempty"`
-	WeeklyTokenLimit  *uint64 `json:"weekly_token_limit,omitempty"`
-	WeeklyReqLimit    *uint64 `json:"weekly_request_limit,omitempty"`
-	ContextLength     *int    `json:"context_length,omitempty"`
-	MaxOutputTokens   *int    `json:"max_output_tokens,omitempty"`
+	Name              string  `json:"name" yaml:"name"`
+	BaseURL           string  `json:"base_url" yaml:"base_url"`
+	Model             string  `json:"model" yaml:"model"`
+	Format            string  `json:"format" yaml:"format"`
+	Timeout           int     `json:"timeout" yaml:"timeout"`
+	APIKey            string  `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	MaskedKey         string  `json:"masked_key,omitempty" yaml:"masked_key,omitempty"`
+	WeeklyTokenLimit  *uint64 `json:"weekly_token_limit,omitempty" yaml:"weekly_token_limit,omitempty"`
+	WeeklyReqLimit    *uint64 `json:"weekly_request_limit,omitempty" yaml:"weekly_request_limit,omitempty"`
+	ContextLength     *int    `json:"context_length,omitempty" yaml:"context_length,omitempty"`
+	MaxOutputTokens   *int    `json:"max_output_tokens,omitempty" yaml:"max_output_tokens,omitempty"`
 }
 
 type PlanConfig struct {
-	Providers []ProviderConfig `json:"providers"`
+	Providers []ProviderConfig `json:"providers" yaml:"providers"`
 }
 
 type PlansConfig struct {
