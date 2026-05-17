@@ -6,3 +6,5 @@ dist/
 .dev.vars
 .wrangler/
 .worktrees
+*.db
+health.db/
