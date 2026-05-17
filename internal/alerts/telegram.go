@@ -3,6 +3,7 @@ package alerts
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -100,6 +101,7 @@ func (b *Bot) pollOnce() {
 
 func (b *Bot) handleCommand(chatID int64, text string) {
 	reply := b.buildReply(text)
+	log.Printf("[telegram] cmd=%q reply_len=%d", text, len(reply))
 	b.sendMessage(chatID, reply)
 }
 
@@ -518,9 +520,8 @@ func formatHealthLine(name string, h types.ProviderHealth) string {
 func (b *Bot) sendMessage(chatID int64, text string) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", b.token)
 	body, _ := json.Marshal(map[string]interface{}{
-		"chat_id":    chatID,
-		"text":       text,
-		"parse_mode": "Markdown",
+		"chat_id": chatID,
+		"text":    text,
 	})
 
 	resp, err := b.client.Post(url, "application/json", strings.NewReader(string(body)))
@@ -529,4 +530,9 @@ func (b *Bot) sendMessage(chatID int64, text string) {
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		log.Printf("telegram API error %d: %s", resp.StatusCode, string(respBody))
+	}
 }

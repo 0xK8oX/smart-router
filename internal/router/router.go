@@ -3,6 +3,7 @@ package router
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -85,6 +86,7 @@ func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming
 		if err != nil {
 			// Network / timeout error
 			latencyMs := time.Since(start).Milliseconds()
+			log.Printf("[ROUTER] FAILURE: plan=%s provider=%s error=%v latency=%dms", planSlug, provider.Name, err, latencyMs)
 			_ = r.healthTracker.RecordFailure(provider.Name, 0, err.Error())
 			_ = r.db.RecordStat(types.StatRecord{
 				Plan:        planSlug,
@@ -122,6 +124,7 @@ func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming
 		}
 
 		latencyMs := time.Since(start).Milliseconds()
+		log.Printf("[ROUTER] FAILURE: plan=%s provider=%s status=%d body=%.200s latency=%dms", planSlug, provider.Name, resp.StatusCode, errBody, latencyMs)
 		_ = r.healthTracker.RecordFailure(provider.Name, resp.StatusCode, errBody)
 		_ = r.db.RecordStat(types.StatRecord{
 			Plan:        planSlug,

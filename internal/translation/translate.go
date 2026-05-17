@@ -2,6 +2,7 @@ package translation
 
 import (
 	"fmt"
+	"strings"
 )
 
 // TranslateRequest converts a request body to the target provider format.
@@ -23,6 +24,10 @@ func TranslateRequest(body map[string]interface{}, targetFormat string) (map[str
 		if _, ok := result["max_tokens"]; !ok {
 			result["max_tokens"] = 4096
 		}
+		// Convert OpenAI messages (system in array) to Anthropic format (top-level system + user/assistant messages).
+		if err := convertOpenAIToAnthropic(result); err != nil {
+			return nil, err
+		}
 	case "openai":
 		// Passthrough — no modifications needed.
 	default:
@@ -30,6 +35,45 @@ func TranslateRequest(body map[string]interface{}, targetFormat string) (map[str
 	}
 
 	return result, nil
+}
+
+// convertOpenAIToAnthropic extracts system messages from the messages array into a
+// top-level system field, keeping only user/assistant in the messages array.
+func convertOpenAIToAnthropic(body map[string]interface{}) error {
+	msgsRaw, ok := body["messages"]
+	if !ok {
+		return nil
+	}
+	msgs, ok := msgsRaw.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	var systemParts []string
+	var newMsgs []interface{}
+
+	for _, m := range msgs {
+		msg, ok := m.(map[string]interface{})
+		if !ok {
+			newMsgs = append(newMsgs, m)
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role == "system" {
+			content, _ := msg["content"].(string)
+			if content != "" {
+				systemParts = append(systemParts, content)
+			}
+			continue
+		}
+		newMsgs = append(newMsgs, msg)
+	}
+
+	if len(systemParts) > 0 {
+		body["system"] = strings.Join(systemParts, "\n")
+	}
+	body["messages"] = newMsgs
+	return nil
 }
 
 // TranslateResponse converts a non-streaming response body.

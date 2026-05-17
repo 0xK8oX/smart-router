@@ -64,3 +64,35 @@ func TestTranslateResponseSameFormat(t *testing.T) {
 		t.Fatalf("expected passthrough, got %s", string(result))
 	}
 }
+
+func TestTranslateRequestAnthropicSystemMessage(t *testing.T) {
+	body := map[string]interface{}{
+		"model": "claude-3-opus",
+		"messages": []interface{}{
+			map[string]interface{}{"role": "system", "content": "You are a helpful assistant."},
+			map[string]interface{}{"role": "user", "content": "hello"},
+		},
+	}
+
+	result, err := TranslateRequest(body, "anthropic")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result["system"] != "You are a helpful assistant." {
+		t.Fatalf("expected system field, got %v", result["system"])
+	}
+
+	msgs, ok := result["messages"].([]interface{})
+	if !ok {
+		t.Fatalf("expected messages to be array, got %T", result["messages"])
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message after removing system, got %d", len(msgs))
+	}
+
+	msg := msgs[0].(map[string]interface{})
+	if msg["role"] != "user" {
+		t.Fatalf("expected user role, got %v", msg["role"])
+	}
+}
