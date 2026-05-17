@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	_ "modernc.org/sqlite"
 	"smart-router/internal/types"
@@ -219,4 +220,32 @@ func (d *DB) DeletePlan(slug string) error {
 
 func (d *DB) Close() error {
 	return d.conn.Close()
+}
+
+type WeeklyUsage struct {
+	RequestTokens  int64 `json:"request_tokens"`
+	ResponseTokens int64 `json:"response_tokens"`
+	RequestCount   int64 `json:"request_count"`
+}
+
+// GetWeeklyUsage returns token and request counts for a provider/key_mask over the last 7 days.
+func (d *DB) GetWeeklyUsage(keyMask string) (*WeeklyUsage, error) {
+	oneWeekAgo := time.Now().Add(-7 * 24 * time.Hour).UnixMilli()
+
+	var reqTokens, respTokens, reqCount sql.NullInt64
+	err := d.conn.QueryRow(`
+		SELECT COALESCE(SUM(request_tokens), 0), COALESCE(SUM(response_tokens), 0), COALESCE(COUNT(*), 0)
+		FROM request_stats
+		WHERE key_mask = ? AND created_at > ? AND status = 'success'
+	`, keyMask, oneWeekAgo).Scan(&reqTokens, &respTokens, &reqCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("query weekly usage: %w", err)
+	}
+
+	return &WeeklyUsage{
+		RequestTokens:  reqTokens.Int64,
+		ResponseTokens: respTokens.Int64,
+		RequestCount:   reqCount.Int64,
+	}, nil
 }

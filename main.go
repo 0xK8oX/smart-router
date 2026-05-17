@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"smart-router/internal/alerts"
 	"smart-router/internal/api"
 	"smart-router/internal/db"
 	"smart-router/internal/health"
@@ -56,6 +57,9 @@ func main() {
 	}
 
 	server := api.NewServer(r, ht, database, adminKey)
+
+	// Start Telegram bot for commands
+	alerts.StartBot(database, ht)
 
 	muxRouter := mux.NewRouter()
 	server.RegisterRoutes(muxRouter)
