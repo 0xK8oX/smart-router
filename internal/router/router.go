@@ -43,6 +43,8 @@ func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming
 		return nil, types.ProviderConfig{}, fmt.Errorf("load plan: %w", err)
 	}
 
+	var providerErrors []string
+
 	for _, provider := range plan.Providers {
 		// Check health
 		h, err := r.healthTracker.GetHealth(provider.Name)
@@ -51,14 +53,23 @@ func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming
 			h = types.ProviderHealth{}
 		}
 		if h.Status == "unhealthy" && h.CooldownUntil > time.Now().Unix() {
+			providerErrors = append(providerErrors, fmt.Sprintf("%s: unhealthy (cooldown)", provider.Name))
 			continue
 		}
 
+		// Override model with provider's configured model
+		translatedBody := make(map[string]interface{}, len(body))
+		for k, v := range body {
+			translatedBody[k] = v
+		}
+		translatedBody["model"] = provider.Model
+
 		// Translate request
-		translatedBody, err := translation.TranslateRequest(body, provider.Format)
+		translatedBody, err = translation.TranslateRequest(translatedBody, provider.Format)
 		if err != nil {
 			// Translation error is fatal for this provider, try next
 			_ = r.healthTracker.RecordFailure(provider.Name, 0, err.Error())
+			providerErrors = append(providerErrors, fmt.Sprintf("%s: translate error", provider.Name))
 			continue
 		}
 
@@ -83,6 +94,7 @@ func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming
 				LatencyMs:   latencyMs,
 				IsStreaming: isStreaming,
 			})
+			providerErrors = append(providerErrors, fmt.Sprintf("%s: %v", provider.Name, err))
 			continue
 		}
 
@@ -119,7 +131,8 @@ func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming
 			LatencyMs:   latencyMs,
 			IsStreaming: isStreaming,
 		})
+		providerErrors = append(providerErrors, fmt.Sprintf("%s: HTTP %d %s", provider.Name, resp.StatusCode, errBody))
 	}
 
-	return nil, types.ProviderConfig{}, fmt.Errorf("all providers failed for plan %s", planSlug)
+	return nil, types.ProviderConfig{}, fmt.Errorf("all providers failed for plan %s: %v", planSlug, providerErrors)
 }
