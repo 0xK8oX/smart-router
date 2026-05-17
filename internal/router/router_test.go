@@ -530,3 +530,89 @@ func TestRouteStreaming(t *testing.T) {
 		t.Errorf("expected is_streaming=true, got false")
 	}
 }
+
+func TestRouteSelectsMatchingModelProvider(t *testing.T) {
+	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"test1"}`))
+	}))
+	defer server1.Close()
+
+	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"test2"}`))
+	}))
+	defer server2.Close()
+
+	sqlitePath := "/tmp/test_router_model_match.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-model-match-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health tracker: %v", err)
+	}
+	defer ht.Close()
+
+	plan := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{
+				Name:    "provider-a",
+				BaseURL: server1.URL,
+				Model:   "model-a",
+				Format:  "openai",
+				Timeout: 5,
+				APIKey:  "sk-a",
+			},
+			{
+				Name:    "provider-b",
+				BaseURL: server2.URL,
+				Model:   "model-b",
+				Format:  "openai",
+				Timeout: 5,
+				APIKey:  "sk-b",
+			},
+		},
+	}
+	if err := database.SavePlan("pro", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+
+	// Request model-b should hit provider-b (second in list but matching model)
+	body := map[string]interface{}{
+		"model":    "model-b",
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	}
+
+	resp, provider, err := router.Route("pro", body, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("expected response, got nil")
+	}
+	defer resp.Body.Close()
+
+	if provider.Name != "provider-b" {
+		t.Errorf("expected provider-b, got %s", provider.Name)
+	}
+
+	// Verify stat recorded for provider-b
+	stats, err := database.GetStats("pro", "provider-b", 10)
+	if err != nil {
+		t.Fatalf("get stats: %v", err)
+	}
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 stat for provider-b, got %d", len(stats))
+	}
+}

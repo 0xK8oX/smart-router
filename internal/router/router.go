@@ -44,9 +44,23 @@ func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming
 		return nil, types.ProviderConfig{}, fmt.Errorf("load plan: %w", err)
 	}
 
+	requestedModel, _ := body["model"].(string)
+
+	// Build ordered provider list: matching model first, then rest in plan order.
+	var orderedProviders []types.ProviderConfig
+	var remaining []types.ProviderConfig
+	for _, p := range plan.Providers {
+		if p.Model == requestedModel {
+			orderedProviders = append(orderedProviders, p)
+		} else {
+			remaining = append(remaining, p)
+		}
+	}
+	orderedProviders = append(orderedProviders, remaining...)
+
 	var providerErrors []string
 
-	for _, provider := range plan.Providers {
+	for _, provider := range orderedProviders {
 		// Check health
 		h, err := r.healthTracker.GetHealth(provider.Name)
 		if err != nil {
