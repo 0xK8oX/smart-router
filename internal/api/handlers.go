@@ -14,6 +14,7 @@ import (
 	"smart-router/internal/db"
 	"smart-router/internal/health"
 	"smart-router/internal/router"
+	"smart-router/internal/translation"
 	"smart-router/internal/types"
 )
 
@@ -124,7 +125,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		isStreaming = stream
 	}
 
-	resp, _, err := s.router.Route(planSlug, body, isStreaming)
+	resp, provider, err := s.router.Route(planSlug, body, isStreaming)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
@@ -137,10 +138,36 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("copy response body error: %v", err)
+
+	if isStreaming {
+		w.WriteHeader(resp.StatusCode)
+		var bodyReader io.Reader = resp.Body
+		if provider.Format != "openai" {
+			bodyReader = translation.SSETranslator(resp.Body, provider.Format, "openai")
+		}
+		if _, err := io.Copy(w, bodyReader); err != nil {
+			log.Printf("copy response body error: %v", err)
+		}
+		return
 	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("read response body error: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to read response")
+		return
+	}
+
+	if provider.Format != "openai" {
+		data, err = translation.TranslateResponse(data, provider.Format, "openai")
+		if err != nil {
+			log.Printf("translate response error: %v", err)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(data)
 }
 
 func (s *Server) handleListPlans(w http.ResponseWriter, r *http.Request) {
