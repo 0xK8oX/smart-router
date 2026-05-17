@@ -23,8 +23,8 @@ func TestLoadPlans(t *testing.T) {
 		t.Fatal("expected 'jason' plan to exist")
 	}
 
-	if len(jasonPlan.Providers) != 3 {
-		t.Fatalf("expected 3 providers in 'jason' plan, got %d", len(jasonPlan.Providers))
+	if len(jasonPlan.Providers) != 5 {
+		t.Fatalf("expected 5 providers in 'jason' plan, got %d", len(jasonPlan.Providers))
 	}
 
 	expectedProviders := []struct {
@@ -35,6 +35,8 @@ func TestLoadPlans(t *testing.T) {
 		timeout int
 	}{
 		{"jason-kimi-2", "https://api.kimi.com/coding/", "k2p6", "anthropic", 60},
+		{"jason-kimi", "https://api.kimi.com/coding/", "k2p6", "anthropic", 60},
+		{"jason-kimi-debbie", "https://api.kimi.com/coding/", "k2p6", "anthropic", 60},
 		{"jason-volcengine", "https://ark.cn-beijing.volces.com/api/coding", "kimi-k2.6", "anthropic", 60},
 		{"jason-minimax", "https://api.minimaxi.com/anthropic", "minimax2.7", "anthropic", 60},
 	}

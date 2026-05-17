@@ -50,7 +50,7 @@ func (c *Client) Call(provider types.ProviderConfig, body map[string]interface{}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(provider.Timeout)*time.Second)
-	defer cancel()
+	_ = cancel // context auto-cancels after timeout; don't cancel early or streaming body closes
 
 	endpoint := buildEndpoint(provider.BaseURL, provider.Format)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(jsonBody))

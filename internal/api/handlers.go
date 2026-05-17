@@ -145,10 +145,28 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if provider.Format != "openai" {
 			bodyReader = translation.SSETranslator(resp.Body, provider.Format, "openai")
 		}
-		if _, err := io.Copy(w, bodyReader); err != nil {
-			log.Printf("copy response body error: %v", err)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			log.Printf("streaming: ResponseWriter does not support flushing")
 		}
-		return
+		buf := make([]byte, 4096)
+		for {
+			n, err := bodyReader.Read(buf)
+			if n > 0 {
+				if _, werr := w.Write(buf[:n]); werr != nil {
+					return
+				}
+				if ok {
+					flusher.Flush()
+				}
+			}
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("streaming read error: %v", err)
+				}
+				return
+			}
+		}
 	}
 
 	data, err := io.ReadAll(resp.Body)
