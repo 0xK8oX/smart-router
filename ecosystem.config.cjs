@@ -6,7 +6,7 @@ module.exports = {
       cwd: "/Volumes/Proj/workspace/smart-router",
       interpreter: "bash",
       env: {
-        NODE_ENV: "development",
+        NODE_ENV: "production",
       },
       log_file: "/tmp/smart-router-pm2.log",
       out_file: "/tmp/smart-router-out.log",
