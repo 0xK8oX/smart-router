@@ -120,6 +120,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		body["model"] = "auto"
 	}
 
+	// Support plan/model syntax: e.g. "chat2api/DeepSeek-V4-Pro" or "sam/kimi-k2.6"
+	if model, ok := body["model"].(string); ok && strings.Contains(model, "/") {
+		parts := strings.SplitN(model, "/", 2)
+		if len(parts) == 2 {
+			planSlug = parts[0]
+			body["model"] = parts[1]
+		}
+	}
+
 	isStreaming := false
 	if stream, ok := body["stream"].(bool); ok {
 		isStreaming = stream
