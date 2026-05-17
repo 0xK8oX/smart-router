@@ -373,6 +373,86 @@ func TestRouteSkipsUnhealthyProvider(t *testing.T) {
 	}
 }
 
+func TestRouteOverridesModelWithProviderConfig(t *testing.T) {
+	var receivedModel string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		// Parse simple model field from JSON body
+		if len(body) > 0 {
+			// Quick parse: find "model":"..."
+			for i := 0; i < len(body)-8; i++ {
+				if string(body[i:i+8]) == `"model":` {
+					start := i + 9
+					end := start + 1
+					for end < len(body) && body[end] != '"' {
+						end++
+					}
+					receivedModel = string(body[start:end])
+					break
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"test","object":"chat.completion","choices":[]}`))
+	}))
+	defer server.Close()
+
+	sqlitePath := "/tmp/test_router_model_override.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-model-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health tracker: %v", err)
+	}
+	defer ht.Close()
+
+	// Provider config says model "kimi-k2.6", request says "gpt-4"
+	plan := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{
+				Name:    "volcengine",
+				BaseURL: server.URL,
+				Model:   "kimi-k2.6",
+				Format:  "openai",
+				Timeout: 5,
+				APIKey:  "sk-test",
+			},
+		},
+	}
+	if err := database.SavePlan("pro", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+
+	body := map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	}
+
+	resp, _, err := router.Route("pro", body, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	if receivedModel != "kimi-k2.6" {
+		t.Errorf("expected model to be overridden to 'kimi-k2.6', got '%s'", receivedModel)
+	}
+}
+
 func TestRouteStreaming(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)

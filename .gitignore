@@ -8,3 +8,4 @@ dist/
 .worktrees
 *.db
 health.db/
+data/
