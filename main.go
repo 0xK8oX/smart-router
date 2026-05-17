@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/gorilla/mux"
 	"smart-router/internal/api"
@@ -45,12 +46,32 @@ func main() {
 
 	r := router.New(ht, database)
 
+	// Seed plans from config file on startup
+	configPath := os.Getenv("CONFIG_PATH")
+	if configPath == "" {
+		configPath = "config/plans.yaml"
+	}
+	if err := api.SeedPlansFromFile(database, configPath); err != nil {
+		log.Printf("warning: failed to seed plans: %v", err)
+	}
+
 	server := api.NewServer(r, ht, database, adminKey)
 
 	muxRouter := mux.NewRouter()
 	server.RegisterRoutes(muxRouter)
 
+	// Logging middleware
+	handler := loggingMiddleware(muxRouter)
+
 	addr := host + ":" + port
 	log.Printf("Smart Router listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, muxRouter))
+	log.Fatal(http.ListenAndServe(addr, handler))
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
+	})
 }

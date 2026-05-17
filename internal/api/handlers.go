@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gorilla/mux"
+	"gopkg.in/yaml.v3"
 	"smart-router/internal/db"
 	"smart-router/internal/health"
 	"smart-router/internal/router"
@@ -426,8 +427,7 @@ func SeedPlansFromFile(database *db.DB, path string) error {
 	var cfg struct {
 		Plans map[string]types.PlanConfig `yaml:"plans"`
 	}
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		// Try YAML
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return err
 	}
 
