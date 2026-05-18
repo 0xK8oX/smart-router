@@ -32,11 +32,28 @@ type ProviderHealth struct {
 	LastActivityAt      int64  `json:"lastActivityAt"`
 }
 
+type APIKey struct {
+	Key                 string   `json:"key"`
+	Name                string   `json:"name"`
+	Plans               []string `json:"plans"`
+	Models              []string `json:"models"`
+	AllowedIPs          []string `json:"allowed_ips"`
+	RateLimitRPM        int      `json:"rate_limit_rpm"`
+	RateLimitRPD        int      `json:"rate_limit_rpd"`
+	MonthlyTokenLimit   int      `json:"monthly_token_limit"`
+	MonthlyRequestLimit int      `json:"monthly_request_limit"`
+	ExpiresAt           *int64   `json:"expires_at,omitempty"`
+	Disabled            bool     `json:"disabled"`
+	CreatedAt           int64    `json:"created_at"`
+	LastUsedAt          *int64   `json:"last_used_at,omitempty"`
+}
+
 type StatRecord struct {
 	Plan           string `json:"plan"`
 	Provider       string `json:"provider"`
 	Model          string `json:"model"`
 	KeyMask        string `json:"key_mask,omitempty"`
+	ClientKey      string `json:"client_key,omitempty"`
 	RequestTokens  int    `json:"request_tokens"`
 	ResponseTokens int    `json:"response_tokens"`
 	TotalTokens    int    `json:"total_tokens"`

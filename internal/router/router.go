@@ -100,8 +100,8 @@ func extractPlanFromURL(baseURL string) string {
 }
 
 // Route finds a healthy provider, calls it, and returns the response.
-func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header) (*http.Response, types.ProviderConfig, error) {
-	return r.routeWithDepth(planSlug, body, isStreaming, clientFormat, headers, 0)
+func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, clientKey string) (*http.Response, types.ProviderConfig, error) {
+	return r.routeWithDepth(planSlug, body, isStreaming, clientFormat, headers, 0, clientKey)
 }
 
 func (r *Router) applyStrategy(planSlug string, strategy string, providers []types.ProviderConfig) []types.ProviderConfig {
@@ -163,7 +163,7 @@ func (r *Router) applyStrategy(planSlug string, strategy string, providers []typ
 	}
 }
 
-func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, depth int) (*http.Response, types.ProviderConfig, error) {
+func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, depth int, clientKey string) (*http.Response, types.ProviderConfig, error) {
 	plan, err := r.getPlanCached(planSlug)
 	if err != nil {
 		return nil, types.ProviderConfig{}, fmt.Errorf("load plan: %w", err)
@@ -196,7 +196,7 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 				continue
 			}
 			targetPlan := extractPlanFromURL(provider.BaseURL)
-			resp, actualProvider, err := r.routeWithDepth(targetPlan, body, isStreaming, clientFormat, headers, depth+1)
+			resp, actualProvider, err := r.routeWithDepth(targetPlan, body, isStreaming, clientFormat, headers, depth+1, clientKey)
 			if err != nil {
 				providerErrors = append(providerErrors, fmt.Sprintf("%s: virtual redirect to %s failed: %v", provider.Name, targetPlan, err))
 				continue
@@ -228,11 +228,12 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 			// Translation error is fatal for this provider, try next
 			_ = r.healthTracker.RecordFailure(provider.Name, 0, err.Error())
 			r.db.RecordStatAsync(types.StatRecord{
-				Plan:     planSlug,
-				Provider: provider.Name,
-				Model:    provider.Model,
-				KeyMask:  types.MaskAPIKey(provider.APIKey),
-				Status:   "failure",
+				Plan:      planSlug,
+				Provider:  provider.Name,
+				Model:     provider.Model,
+				KeyMask:   types.MaskAPIKey(provider.APIKey),
+				ClientKey: clientKey,
+				Status:    "failure",
 			})
 			providerErrors = append(providerErrors, fmt.Sprintf("%s: translate error", provider.Name))
 			continue
@@ -261,6 +262,7 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 				Provider:    provider.Name,
 				Model:       provider.Model,
 				KeyMask:     types.MaskAPIKey(provider.APIKey),
+				ClientKey:   clientKey,
 				Status:      "failure",
 				LatencyMs:   latencyMs,
 				IsStreaming: isStreaming,
@@ -294,6 +296,7 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 			Provider:    provider.Name,
 			Model:       provider.Model,
 			KeyMask:     types.MaskAPIKey(provider.APIKey),
+			ClientKey:   clientKey,
 			Status:      "failure",
 			LatencyMs:   latencyMs,
 			IsStreaming: isStreaming,

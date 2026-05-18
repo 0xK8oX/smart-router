@@ -9,6 +9,7 @@ import (
 	"github.com/gorilla/mux"
 	"smart-router/internal/alerts"
 	"smart-router/internal/api"
+	"smart-router/internal/auth"
 	"smart-router/internal/db"
 	"smart-router/internal/health"
 	"smart-router/internal/router"
@@ -57,7 +58,9 @@ func main() {
 	}
 	r.InvalidateAllPlanCache()
 
-	server := api.NewServer(r, ht, database, adminKey)
+	rateLimiter := auth.NewRateLimiter()
+	authHandler := api.NewAuth(database, rateLimiter)
+	server := api.NewServer(r, ht, database, authHandler, adminKey)
 
 	// Start Telegram bot for commands
 	alerts.StartBot(database, ht)
@@ -65,7 +68,8 @@ func main() {
 	muxRouter := mux.NewRouter()
 	server.RegisterRoutes(muxRouter)
 
-	// Logging middleware
+	// Auth middleware first, then logging
+	muxRouter.Use(authHandler.Middleware)
 	handler := loggingMiddleware(muxRouter)
 
 	addr := host + ":" + port

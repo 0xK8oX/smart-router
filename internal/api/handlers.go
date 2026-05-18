@@ -13,6 +13,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"gopkg.in/yaml.v3"
+	"smart-router/internal/auth"
 	"smart-router/internal/db"
 	"smart-router/internal/health"
 	"smart-router/internal/router"
@@ -24,14 +25,16 @@ type Server struct {
 	router   *router.Router
 	health   *health.HealthTracker
 	db       *db.DB
+	auth     *Auth
 	adminKey string
 }
 
-func NewServer(r *router.Router, h *health.HealthTracker, d *db.DB, adminKey string) *Server {
+func NewServer(r *router.Router, h *health.HealthTracker, d *db.DB, a *Auth, adminKey string) *Server {
 	return &Server{
 		router:   r,
 		health:   h,
 		db:       d,
+		auth:     a,
 		adminKey: adminKey,
 	}
 }
@@ -50,6 +53,17 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/v1/stats", s.handleStats).Methods(http.MethodGet, http.MethodOptions)
 	r.HandleFunc("/v1/stats/aggregated", s.handleStatsAggregated).Methods(http.MethodGet, http.MethodOptions)
 
+	// API Key admin endpoints
+	r.HandleFunc("/v1/keys", s.handleListKeys).Methods(http.MethodGet, http.MethodOptions)
+	r.HandleFunc("/v1/keys", s.handleCreateKey).Methods(http.MethodPost, http.MethodOptions)
+	r.HandleFunc("/v1/keys/{key}", s.handleGetKey).Methods(http.MethodGet, http.MethodOptions)
+	r.HandleFunc("/v1/keys/{key}", s.handleUpdateKey).Methods(http.MethodPut, http.MethodOptions)
+	r.HandleFunc("/v1/keys/{key}", s.handleDeleteKey).Methods(http.MethodDelete, http.MethodOptions)
+	r.HandleFunc("/v1/keys/{key}/usage", s.handleKeyUsage).Methods(http.MethodGet, http.MethodOptions)
+	r.HandleFunc("/v1/audit", s.handleListAudit).Methods(http.MethodGet, http.MethodOptions)
+	r.HandleFunc("/v1/pricing", s.handleListPricing).Methods(http.MethodGet, http.MethodOptions)
+	r.HandleFunc("/v1/pricing/{model}", s.handleSetPricing).Methods(http.MethodPut, http.MethodOptions)
+
 	// CORS preflight
 	r.Methods(http.MethodOptions).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
@@ -63,7 +77,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Plan, X-Admin-Key")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Plan, X-Admin-Key, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -148,7 +162,7 @@ func extractUsageFromStream(data []byte, format string) (reqTokens, respTokens i
 	return
 }
 
-func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig, latencyMs int64, isStreaming bool, data []byte, clientFormat string) {
+func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig, latencyMs int64, isStreaming bool, data []byte, clientFormat string, clientKey string) {
 	reqTokens, respTokens := 0, 0
 	if len(data) > 0 {
 		reqTokens, respTokens = extractUsage(data, clientFormat)
@@ -158,6 +172,7 @@ func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig
 		Provider:       provider.Name,
 		Model:          provider.Model,
 		KeyMask:        types.MaskAPIKey(provider.APIKey),
+		ClientKey:      clientKey,
 		RequestTokens:  reqTokens,
 		ResponseTokens: respTokens,
 		TotalTokens:    reqTokens + respTokens,
@@ -179,7 +194,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string) {
+func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string, clientKey string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Printf("streaming: ResponseWriter does not support flushing")
@@ -212,6 +227,7 @@ func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSl
 				Provider:       provider.Name,
 				Model:          provider.Model,
 				KeyMask:        types.MaskAPIKey(provider.APIKey),
+				ClientKey:      clientKey,
 				RequestTokens:  reqTokens,
 				ResponseTokens: respTokens,
 				TotalTokens:    reqTokens + respTokens,
@@ -262,7 +278,28 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 		isStreaming = stream
 	}
 
-	resp, provider, err := s.router.Route(planSlug, body, isStreaming, clientFormat, r.Header)
+	clientKey := ClientKeyFromContext(r.Context())
+
+	// Model restriction check for authenticated requests
+	if clientKey != "" {
+		apiKey, _ := s.auth.getKeyCached(clientKey)
+		if apiKey != nil && len(apiKey.Models) > 0 {
+			requestedModel, _ := body["model"].(string)
+			allowed := false
+			for _, m := range apiKey.Models {
+				if m == requestedModel || m == "*" {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				writeError(w, http.StatusForbidden, "model not allowed for this key")
+				return
+			}
+		}
+	}
+
+	resp, provider, err := s.router.Route(planSlug, body, isStreaming, clientFormat, r.Header, clientKey)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
@@ -287,7 +324,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 		if provider.Format != clientFormat {
 			bodyReader = translation.SSETranslator(resp.Body, provider.Format, clientFormat)
 		}
-		s.proxyStream(w, bodyReader, planSlug, provider, start, clientFormat)
+		s.proxyStream(w, bodyReader, planSlug, provider, start, clientFormat, clientKey)
 		return
 	}
 
@@ -306,7 +343,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 	}
 
 	latencyMs := time.Since(start).Milliseconds()
-	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat)
+	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat, clientKey)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
@@ -671,4 +708,204 @@ func ensureDefaultPlan(database *db.DB) error {
 		Providers: []types.ProviderConfig{},
 	}
 	return database.SavePlan("default", defaultPlan)
+}
+
+func maskAPIKey(key string) string {
+	if len(key) <= 8 {
+		return "****"
+	}
+	return key[:4] + "****" + key[len(key)-4:]
+}
+
+func requireAdmin(w http.ResponseWriter, r *http.Request, adminKey string) bool {
+	if r.Header.Get("X-Admin-Key") != adminKey {
+		writeError(w, http.StatusForbidden, "invalid admin key")
+		return false
+	}
+	return true
+}
+
+func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	var req types.APIKey
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	req.Key = auth.GenerateAPIKey()
+	req.CreatedAt = time.Now().Unix()
+	if err := s.db.CreateAPIKey(req); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.db.RecordAudit("key_created", req.Key, r.Header.Get("X-Admin-Key"), "")
+	writeJSON(w, http.StatusOK, map[string]string{"key": req.Key})
+}
+
+func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	keys, err := s.db.ListAPIKeys()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Mask key values in listing
+	for i := range keys {
+		keys[i].Key = maskAPIKey(keys[i].Key)
+	}
+	writeJSON(w, http.StatusOK, keys)
+}
+
+func (s *Server) handleGetKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	key := mux.Vars(r)["key"]
+	k, err := s.db.GetAPIKey(key)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, k)
+}
+
+func (s *Server) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	key := mux.Vars(r)["key"]
+	var updates types.APIKey
+	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := s.db.UpdateAPIKey(key, updates); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.db.RecordAudit("key_updated", key, r.Header.Get("X-Admin-Key"), "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	key := mux.Vars(r)["key"]
+	if err := s.db.DeleteAPIKey(key); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.db.RecordAudit("key_deleted", key, r.Header.Get("X-Admin-Key"), "")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleKeyUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	key := mux.Vars(r)["key"]
+	now := time.Now()
+	monthly, err := s.db.GetKeyMonthlyUsage(key, now.Year(), int(now.Month()))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	weekly, err := s.db.GetKeyUsageSince(key, now.Add(-7*24*time.Hour))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	cost, _ := s.db.GetKeyMonthlyCost(key, now.Year(), int(now.Month()))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"monthly": monthly,
+		"weekly":  weekly,
+		"cost":    cost,
+	})
+}
+
+func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	limit := 100
+	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 {
+		limit = n
+		if limit > 1000 {
+			limit = 1000
+		}
+	}
+	logs, err := s.db.ListAuditLogs(limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, logs)
+}
+
+func (s *Server) handleListPricing(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "not yet implemented"})
+}
+
+func (s *Server) handleSetPricing(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	model := mux.Vars(r)["model"]
+	var req struct {
+		InputPrice  float64 `json:"input_price_per_1k"`
+		OutputPrice float64 `json:"output_price_per_1k"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := s.db.SetModelPricing(model, req.InputPrice, req.OutputPrice); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

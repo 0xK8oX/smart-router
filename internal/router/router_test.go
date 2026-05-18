@@ -64,7 +64,7 @@ func TestRouteSuccess(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false, "openai", nil)
+	resp, provider, err := router.Route("pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestRouteFailover(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false, "openai", nil)
+	resp, provider, err := router.Route("pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestRouteAllFail(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, false, "openai", nil)
+	resp, _, err := router.Route("pro", body, false, "openai", nil, "")
 	if err == nil {
 		t.Fatal("expected error when all providers fail, got nil")
 	}
@@ -326,7 +326,7 @@ func TestRouteSkipsUnhealthyProvider(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false, "openai", nil)
+	resp, provider, err := router.Route("pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -409,7 +409,7 @@ func TestRouteOverridesModelWithProviderConfig(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, false, "openai", nil)
+	resp, _, err := router.Route("pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestRouteStreaming(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, true, "openai", nil)
+	resp, _, err := router.Route("pro", body, true, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -558,7 +558,7 @@ func TestRouteVirtualProvider(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("outer", body, false, "openai", nil)
+	resp, provider, err := router.Route("outer", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -625,7 +625,7 @@ func TestRouteVirtualProviderMaxDepth(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("plan-a", body, false, "openai", nil)
+	resp, _, err := router.Route("plan-a", body, false, "openai", nil, "")
 	if err == nil {
 		if resp != nil {
 			resp.Body.Close()
@@ -713,7 +713,7 @@ func TestRouteVirtualProviderFailover(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("outer", body, false, "openai", nil)
+	resp, provider, err := router.Route("outer", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -794,21 +794,21 @@ func TestRouteRoundRobin(t *testing.T) {
 	}
 
 	// First request should hit provider-a
-	resp1, provider1, err := router.Route("rr", body, false, "openai", nil)
+	resp1, provider1, err := router.Route("rr", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resp1.Body.Close()
 
 	// Second request should hit provider-b
-	resp2, provider2, err := router.Route("rr", body, false, "openai", nil)
+	resp2, provider2, err := router.Route("rr", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resp2.Body.Close()
 
 	// Third request should hit provider-a again
-	resp3, provider3, err := router.Route("rr", body, false, "openai", nil)
+	resp3, provider3, err := router.Route("rr", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -893,7 +893,7 @@ func TestRouteWeightedRoundRobin(t *testing.T) {
 	// With weights 3:1, first 3 requests should hit provider-a, then provider-b
 	names := make([]string, 4)
 	for i := 0; i < 4; i++ {
-		resp, provider, err := router.Route("wrr", body, false, "openai", nil)
+		resp, provider, err := router.Route("wrr", body, false, "openai", nil, "")
 		if err != nil {
 			t.Fatalf("unexpected error on req %d: %v", i, err)
 		}
@@ -973,21 +973,21 @@ func TestRouteLRU(t *testing.T) {
 	}
 
 	// First request: both unused, provider-a first in plan order after LRU sort (equal -> stable-ish)
-	resp1, provider1, err := router.Route("lru", body, false, "openai", nil)
+	resp1, provider1, err := router.Route("lru", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resp1.Body.Close()
 
 	// Second request: provider-a was just used, provider-b is LRU
-	resp2, provider2, err := router.Route("lru", body, false, "openai", nil)
+	resp2, provider2, err := router.Route("lru", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resp2.Body.Close()
 
 	// Third request: provider-b was just used, provider-a is LRU
-	resp3, provider3, err := router.Route("lru", body, false, "openai", nil)
+	resp3, provider3, err := router.Route("lru", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1064,7 +1064,7 @@ func TestRouteSelectsMatchingModelProvider(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false, "openai", nil)
+	resp, provider, err := router.Route("pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

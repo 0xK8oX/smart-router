@@ -19,6 +19,7 @@ var migrations = []string{
 		provider TEXT NOT NULL,
 		model TEXT NOT NULL,
 		key_mask TEXT,
+		client_key TEXT,
 		request_tokens INTEGER NOT NULL DEFAULT 0,
 		response_tokens INTEGER NOT NULL DEFAULT 0,
 		total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -31,9 +32,47 @@ var migrations = []string{
 	`CREATE INDEX IF NOT EXISTS idx_stats_plan ON request_stats(plan);`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_provider ON request_stats(provider);`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_created ON request_stats(created_at);`,
+	`CREATE INDEX IF NOT EXISTS idx_stats_client_key ON request_stats(client_key);`,
 	`CREATE TABLE IF NOT EXISTS plans (
 		slug TEXT PRIMARY KEY,
 		config TEXT NOT NULL
+	);`,
+	`CREATE TABLE IF NOT EXISTS api_keys (
+		key TEXT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		plans TEXT NOT NULL DEFAULT '[]',
+		models TEXT NOT NULL DEFAULT '[]',
+		allowed_ips TEXT NOT NULL DEFAULT '[]',
+		rate_limit_rpm INTEGER NOT NULL DEFAULT 0,
+		rate_limit_rpd INTEGER NOT NULL DEFAULT 0,
+		monthly_token_limit INTEGER NOT NULL DEFAULT 0,
+		monthly_request_limit INTEGER NOT NULL DEFAULT 0,
+		expires_at INTEGER,
+		disabled INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+		last_used_at INTEGER
+	);`,
+	`CREATE INDEX IF NOT EXISTS idx_api_keys_disabled ON api_keys(disabled);`,
+	`CREATE TABLE IF NOT EXISTS audit_log (
+		id INTEGER PRIMARY KEY,
+		action TEXT NOT NULL,
+		target_key TEXT,
+		actor TEXT,
+		details TEXT,
+		created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+	);`,
+	`CREATE TABLE IF NOT EXISTS model_pricing (
+		model TEXT PRIMARY KEY,
+		input_price_per_1k REAL NOT NULL DEFAULT 0,
+		output_price_per_1k REAL NOT NULL DEFAULT 0
+	);`,
+	`CREATE TABLE IF NOT EXISTS key_groups (
+		id INTEGER PRIMARY KEY,
+		name TEXT NOT NULL,
+		monthly_token_limit INTEGER NOT NULL DEFAULT 0,
+		monthly_request_limit INTEGER NOT NULL DEFAULT 0,
+		monthly_budget_limit REAL NOT NULL DEFAULT 0,
+		webhook_url TEXT
 	);`,
 }
 
@@ -104,9 +143,9 @@ func (d *DB) RecordStatBatch(records []types.StatRecord) error {
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO request_stats
-			(plan, provider, model, key_mask, request_tokens, response_tokens, total_tokens, status, latency_ms, is_streaming, target_provider)
+			(plan, provider, model, key_mask, client_key, request_tokens, response_tokens, total_tokens, status, latency_ms, is_streaming, target_provider)
 		VALUES
-			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare batch stmt: %w", err)
@@ -119,7 +158,7 @@ func (d *DB) RecordStatBatch(records []types.StatRecord) error {
 			streaming = 1
 		}
 		if _, err := stmt.Exec(
-			r.Plan, r.Provider, r.Model, r.KeyMask,
+			r.Plan, r.Provider, r.Model, r.KeyMask, r.ClientKey,
 			r.RequestTokens, r.ResponseTokens, r.TotalTokens,
 			r.Status, r.LatencyMs, streaming, r.TargetProvider,
 		); err != nil {
@@ -197,7 +236,7 @@ func (d *DB) RecordStatAsync(r types.StatRecord) {
 
 func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, error) {
 	query := `
-		SELECT plan, provider, model, key_mask, request_tokens, response_tokens, total_tokens, status, latency_ms, is_streaming, target_provider
+		SELECT plan, provider, model, key_mask, client_key, request_tokens, response_tokens, total_tokens, status, latency_ms, is_streaming, target_provider
 		FROM request_stats
 		WHERE 1=1`
 	args := []any{}
@@ -233,6 +272,7 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 			&r.Provider,
 			&r.Model,
 			&r.KeyMask,
+			&r.ClientKey,
 			&r.RequestTokens,
 			&r.ResponseTokens,
 			&r.TotalTokens,
@@ -407,4 +447,292 @@ func (d *DB) GetWeeklyUsage(keyMask string) (*WeeklyUsage, error) {
 // GetWeeklyUsageForPlan returns token and request counts for a provider/key_mask within a specific plan over the last 7 days.
 func (d *DB) GetWeeklyUsageForPlan(plan, keyMask string) (*WeeklyUsage, error) {
 	return d.GetUsageSinceForPlan(plan, keyMask, time.Now().Add(-7*24*time.Hour))
+}
+
+type MonthlyUsage struct {
+	RequestTokens  int64   `json:"request_tokens"`
+	ResponseTokens int64   `json:"response_tokens"`
+	RequestCount   int64   `json:"request_count"`
+	Cost           float64 `json:"cost"`
+}
+
+// scanAPIKey reads an api_keys row into a types.APIKey.
+func scanAPIKey(rows *sql.Rows) (types.APIKey, error) {
+	var k types.APIKey
+	var plansJSON, modelsJSON, ipsJSON string
+	var disabled int
+	var lastUsed sql.NullInt64
+	var expiresAt sql.NullInt64
+	err := rows.Scan(
+		&k.Key,
+		&k.Name,
+		&plansJSON,
+		&modelsJSON,
+		&ipsJSON,
+		&k.RateLimitRPM,
+		&k.RateLimitRPD,
+		&k.MonthlyTokenLimit,
+		&k.MonthlyRequestLimit,
+		&expiresAt,
+		&disabled,
+		&k.CreatedAt,
+		&lastUsed,
+	)
+	if err != nil {
+		return k, err
+	}
+	k.Disabled = disabled != 0
+	if expiresAt.Valid {
+		k.ExpiresAt = &expiresAt.Int64
+	}
+	if lastUsed.Valid {
+		k.LastUsedAt = &lastUsed.Int64
+	}
+	_ = json.Unmarshal([]byte(plansJSON), &k.Plans)
+	_ = json.Unmarshal([]byte(modelsJSON), &k.Models)
+	_ = json.Unmarshal([]byte(ipsJSON), &k.AllowedIPs)
+	return k, nil
+}
+
+func (d *DB) CreateAPIKey(key types.APIKey) error {
+	plansJSON, _ := json.Marshal(key.Plans)
+	modelsJSON, _ := json.Marshal(key.Models)
+	ipsJSON, _ := json.Marshal(key.AllowedIPs)
+	var expiresAt interface{}
+	if key.ExpiresAt != nil {
+		expiresAt = *key.ExpiresAt
+	}
+	_, err := d.conn.Exec(`
+		INSERT INTO api_keys
+			(key, name, plans, models, allowed_ips, rate_limit_rpm, rate_limit_rpd, monthly_token_limit, monthly_request_limit, expires_at, disabled, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, key.Key, key.Name, string(plansJSON), string(modelsJSON), string(ipsJSON),
+		key.RateLimitRPM, key.RateLimitRPD, key.MonthlyTokenLimit, key.MonthlyRequestLimit,
+		expiresAt, 0, key.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("create api key: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) GetAPIKey(key string) (*types.APIKey, error) {
+	rows, err := d.conn.Query(`
+		SELECT key, name, plans, models, allowed_ips, rate_limit_rpm, rate_limit_rpd,
+			monthly_token_limit, monthly_request_limit, expires_at, disabled, created_at, last_used_at
+		FROM api_keys WHERE key = ?
+	`, key)
+	if err != nil {
+		return nil, fmt.Errorf("query api key: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, fmt.Errorf("api key not found")
+	}
+	k, err := scanAPIKey(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan api key: %w", err)
+	}
+	return &k, nil
+}
+
+func (d *DB) ListAPIKeys() ([]types.APIKey, error) {
+	rows, err := d.conn.Query(`
+		SELECT key, name, plans, models, allowed_ips, rate_limit_rpm, rate_limit_rpd,
+			monthly_token_limit, monthly_request_limit, expires_at, disabled, created_at, last_used_at
+		FROM api_keys ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list api keys: %w", err)
+	}
+	defer rows.Close()
+
+	var results []types.APIKey
+	for rows.Next() {
+		k, err := scanAPIKey(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan api key: %w", err)
+		}
+		results = append(results, k)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+	return results, nil
+}
+
+func (d *DB) UpdateAPIKey(key string, updates types.APIKey) error {
+	plansJSON, _ := json.Marshal(updates.Plans)
+	modelsJSON, _ := json.Marshal(updates.Models)
+	ipsJSON, _ := json.Marshal(updates.AllowedIPs)
+	var expiresAt interface{}
+	if updates.ExpiresAt != nil {
+		expiresAt = *updates.ExpiresAt
+	}
+	_, err := d.conn.Exec(`
+		UPDATE api_keys SET
+			name = ?, plans = ?, models = ?, allowed_ips = ?,
+			rate_limit_rpm = ?, rate_limit_rpd = ?,
+			monthly_token_limit = ?, monthly_request_limit = ?,
+			expires_at = ?, disabled = ?
+		WHERE key = ?
+	`, updates.Name, string(plansJSON), string(modelsJSON), string(ipsJSON),
+		updates.RateLimitRPM, updates.RateLimitRPD,
+		updates.MonthlyTokenLimit, updates.MonthlyRequestLimit,
+		expiresAt, updates.Disabled, key)
+	if err != nil {
+		return fmt.Errorf("update api key: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) DeleteAPIKey(key string) error {
+	_, err := d.conn.Exec(`DELETE FROM api_keys WHERE key = ?`, key)
+	if err != nil {
+		return fmt.Errorf("delete api key: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) UpdateKeyLastUsed(key string) error {
+	_, err := d.conn.Exec(`UPDATE api_keys SET last_used_at = ? WHERE key = ?`, time.Now().Unix(), key)
+	return err
+}
+
+func (d *DB) GetKeyUsageSince(key string, since time.Time) (*WeeklyUsage, error) {
+	var reqTokens, respTokens, reqCount sql.NullInt64
+	err := d.conn.QueryRow(`
+		SELECT COALESCE(SUM(request_tokens), 0), COALESCE(SUM(response_tokens), 0), COALESCE(COUNT(*), 0)
+		FROM request_stats
+		WHERE client_key = ? AND created_at > ? AND status = 'success'
+	`, key, since.UnixMilli()).Scan(&reqTokens, &respTokens, &reqCount)
+	if err != nil {
+		return nil, fmt.Errorf("query key usage: %w", err)
+	}
+	return &WeeklyUsage{
+		RequestTokens:  reqTokens.Int64,
+		ResponseTokens: respTokens.Int64,
+		RequestCount:   reqCount.Int64,
+	}, nil
+}
+
+func (d *DB) GetKeyMonthlyUsage(key string, year, month int) (*MonthlyUsage, error) {
+	start := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 1, 0)
+	var reqTokens, respTokens, reqCount sql.NullInt64
+	err := d.conn.QueryRow(`
+		SELECT COALESCE(SUM(request_tokens), 0), COALESCE(SUM(response_tokens), 0), COALESCE(COUNT(*), 0)
+		FROM request_stats
+		WHERE client_key = ? AND created_at >= ? AND created_at < ? AND status = 'success'
+	`, key, start.UnixMilli(), end.UnixMilli()).Scan(&reqTokens, &respTokens, &reqCount)
+	if err != nil {
+		return nil, fmt.Errorf("query monthly usage: %w", err)
+	}
+	return &MonthlyUsage{
+		RequestTokens:  reqTokens.Int64,
+		ResponseTokens: respTokens.Int64,
+		RequestCount:   reqCount.Int64,
+	}, nil
+}
+
+func (d *DB) RecordAudit(action, targetKey, actor, details string) error {
+	_, err := d.conn.Exec(`
+		INSERT INTO audit_log (action, target_key, actor, details)
+		VALUES (?, ?, ?, ?)
+	`, action, targetKey, actor, details)
+	if err != nil {
+		return fmt.Errorf("record audit: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) ListAuditLogs(limit int) ([]map[string]interface{}, error) {
+	query := `SELECT id, action, target_key, actor, details, created_at FROM audit_log ORDER BY created_at DESC`
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	rows, err := d.conn.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("list audit: %w", err)
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		var id int
+		var action, targetKey, actor, details string
+		var createdAt int64
+		if err := rows.Scan(&id, &action, &targetKey, &actor, &details, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan audit: %w", err)
+		}
+		results = append(results, map[string]interface{}{
+			"id":         id,
+			"action":     action,
+			"target_key": targetKey,
+			"actor":      actor,
+			"details":    details,
+			"created_at": createdAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+	return results, nil
+}
+
+func (d *DB) SetModelPricing(model string, inputPrice, outputPrice float64) error {
+	_, err := d.conn.Exec(`
+		INSERT INTO model_pricing (model, input_price_per_1k, output_price_per_1k)
+		VALUES (?, ?, ?)
+		ON CONFLICT(model) DO UPDATE SET
+			input_price_per_1k = excluded.input_price_per_1k,
+			output_price_per_1k = excluded.output_price_per_1k
+	`, model, inputPrice, outputPrice)
+	if err != nil {
+		return fmt.Errorf("set pricing: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) GetModelPricing(model string) (float64, float64, error) {
+	var inputPrice, outputPrice float64
+	err := d.conn.QueryRow(`
+		SELECT input_price_per_1k, output_price_per_1k FROM model_pricing WHERE model = ?
+	`, model).Scan(&inputPrice, &outputPrice)
+	if err == sql.ErrNoRows {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, fmt.Errorf("get pricing: %w", err)
+	}
+	return inputPrice, outputPrice, nil
+}
+
+func (d *DB) GetKeyMonthlyCost(key string, year, month int) (float64, error) {
+	start := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 1, 0)
+	rows, err := d.conn.Query(`
+		SELECT model, request_tokens, response_tokens
+		FROM request_stats
+		WHERE client_key = ? AND created_at >= ? AND created_at < ? AND status = 'success'
+	`, key, start.UnixMilli(), end.UnixMilli())
+	if err != nil {
+		return 0, fmt.Errorf("query stats for cost: %w", err)
+	}
+	defer rows.Close()
+
+	totalCost := 0.0
+	for rows.Next() {
+		var model string
+		var reqTokens, respTokens int
+		if err := rows.Scan(&model, &reqTokens, &respTokens); err != nil {
+			return 0, fmt.Errorf("scan stat: %w", err)
+		}
+		inPrice, outPrice, _ := d.GetModelPricing(model)
+		totalCost += float64(reqTokens) / 1000.0 * inPrice
+		totalCost += float64(respTokens) / 1000.0 * outPrice
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("rows error: %w", err)
+	}
+	return totalCost, nil
 }
