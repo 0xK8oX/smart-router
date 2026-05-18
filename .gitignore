@@ -9,3 +9,4 @@ dist/
 *.db
 health.db/
 data/
+smart-router
