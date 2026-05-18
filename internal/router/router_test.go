@@ -64,7 +64,7 @@ func TestRouteSuccess(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false)
+	resp, provider, err := router.Route("pro", body, false, "openai", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -80,17 +80,7 @@ func TestRouteSuccess(t *testing.T) {
 		t.Errorf("expected provider openai, got %s", provider.Name)
 	}
 
-	// Verify stat was recorded
-	stats, err := database.GetStats("pro", "openai", 10)
-	if err != nil {
-		t.Fatalf("get stats: %v", err)
-	}
-	if len(stats) != 1 {
-		t.Fatalf("expected 1 stat, got %d", len(stats))
-	}
-	if stats[0].Status != "success" {
-		t.Errorf("expected status success, got %s", stats[0].Status)
-	}
+	// Success stats are now recorded by the HTTP handler, not the router.
 }
 
 func TestRouteFailover(t *testing.T) {
@@ -159,7 +149,7 @@ func TestRouteFailover(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false)
+	resp, provider, err := router.Route("pro", body, false, "openai", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -175,33 +165,20 @@ func TestRouteFailover(t *testing.T) {
 		t.Errorf("expected provider openai-good, got %s", provider.Name)
 	}
 
-	// Verify stats: one failure and one success
+	// Verify failure stat recorded for the first (bad) provider.
+	// Success stats are recorded by the HTTP handler, not the router.
 	stats, err := database.GetStats("pro", "", 10)
 	if err != nil {
 		t.Fatalf("get stats: %v", err)
 	}
-	if len(stats) != 2 {
-		t.Fatalf("expected 2 stats, got %d", len(stats))
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 failure stat, got %d", len(stats))
 	}
-
-	// Collect statuses and providers (order may vary due to second-level timestamp precision)
-	statuses := map[string]bool{}
-	providers := map[string]bool{}
-	for _, s := range stats {
-		statuses[s.Status] = true
-		providers[s.Provider] = true
+	if stats[0].Status != "failure" {
+		t.Errorf("expected status failure, got %s", stats[0].Status)
 	}
-	if !statuses["success"] {
-		t.Errorf("expected a success stat")
-	}
-	if !statuses["failure"] {
-		t.Errorf("expected a failure stat")
-	}
-	if !providers["openai-good"] {
-		t.Errorf("expected a stat for openai-good")
-	}
-	if !providers["openai-bad"] {
-		t.Errorf("expected a stat for openai-bad")
+	if stats[0].Provider != "openai-bad" {
+		t.Errorf("expected provider openai-bad, got %s", stats[0].Provider)
 	}
 }
 
@@ -253,7 +230,7 @@ func TestRouteAllFail(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, false)
+	resp, _, err := router.Route("pro", body, false, "openai", nil)
 	if err == nil {
 		t.Fatal("expected error when all providers fail, got nil")
 	}
@@ -347,7 +324,7 @@ func TestRouteSkipsUnhealthyProvider(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false)
+	resp, provider, err := router.Route("pro", body, false, "openai", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -360,17 +337,7 @@ func TestRouteSkipsUnhealthyProvider(t *testing.T) {
 		t.Errorf("expected provider healthy-provider, got %s", provider.Name)
 	}
 
-	// Verify only success stat for healthy provider
-	stats, err := database.GetStats("pro", "", 10)
-	if err != nil {
-		t.Fatalf("get stats: %v", err)
-	}
-	if len(stats) != 1 {
-		t.Fatalf("expected 1 stat, got %d", len(stats))
-	}
-	if stats[0].Provider != "healthy-provider" {
-		t.Errorf("expected provider healthy-provider, got %s", stats[0].Provider)
-	}
+	// Success stats are recorded by the HTTP handler, not the router.
 }
 
 func TestRouteOverridesModelWithProviderConfig(t *testing.T) {
@@ -440,7 +407,7 @@ func TestRouteOverridesModelWithProviderConfig(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, false)
+	resp, _, err := router.Route("pro", body, false, "openai", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -505,7 +472,7 @@ func TestRouteStreaming(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, true)
+	resp, _, err := router.Route("pro", body, true, "openai", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -518,17 +485,7 @@ func TestRouteStreaming(t *testing.T) {
 		t.Errorf("expected status 200, got %d", resp.StatusCode)
 	}
 
-	// Verify streaming flag in stat
-	stats, err := database.GetStats("pro", "", 10)
-	if err != nil {
-		t.Fatalf("get stats: %v", err)
-	}
-	if len(stats) != 1 {
-		t.Fatalf("expected 1 stat, got %d", len(stats))
-	}
-	if !stats[0].IsStreaming {
-		t.Errorf("expected is_streaming=true, got false")
-	}
+	// Streaming flag verified by handler stat recording, not router.
 }
 
 func TestRouteSelectsMatchingModelProvider(t *testing.T) {
@@ -594,7 +551,7 @@ func TestRouteSelectsMatchingModelProvider(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false)
+	resp, provider, err := router.Route("pro", body, false, "openai", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -607,12 +564,5 @@ func TestRouteSelectsMatchingModelProvider(t *testing.T) {
 		t.Errorf("expected provider-b, got %s", provider.Name)
 	}
 
-	// Verify stat recorded for provider-b
-	stats, err := database.GetStats("pro", "provider-b", 10)
-	if err != nil {
-		t.Fatalf("get stats: %v", err)
-	}
-	if len(stats) != 1 {
-		t.Fatalf("expected 1 stat for provider-b, got %d", len(stats))
-	}
+	// Success stats are recorded by the HTTP handler, not the router.
 }

@@ -188,7 +188,7 @@ func (b *Bot) cmdPlan(args []string) string {
 		if mask != p.Name {
 			usage, _ := b.db.GetWeeklyUsage(mask)
 			if usage != nil {
-				lines = append(lines, fmt.Sprintf("    weekly: %d req, %d tok", usage.RequestCount, usage.RequestTokens+usage.ResponseTokens))
+				lines = append(lines, fmt.Sprintf("    weekly: %s req, %s tok", formatNumber(usage.RequestCount), formatNumber(usage.RequestTokens+usage.ResponseTokens)))
 			}
 		}
 	}
@@ -264,25 +264,127 @@ func (b *Bot) cmdStats(args []string) string {
 		if s.Status != "success" {
 			emoji = "🔴"
 		}
-		lines = append(lines, fmt.Sprintf("%s `%s/%s` %s %dms %d tok", emoji, s.Plan, s.Provider, s.Status, s.LatencyMs, s.TotalTokens))
+		lines = append(lines, fmt.Sprintf("%s `%s/%s` %s %dms %s tok", emoji, s.Plan, s.Provider, s.Status, s.LatencyMs, formatNumber(int64(s.TotalTokens))))
 	}
 
 	return strings.Join(lines, "\n")
 }
 
-func (b *Bot) cmdUsage(args []string) string {
-	if len(args) < 1 {
-		return "Usage: /usage <key_mask_or_provider>"
+// formatNumber converts large numbers to K/M/B for display.
+func formatNumber(n int64) string {
+	if n >= 1_000_000_000 {
+		return fmt.Sprintf("%.1fB", float64(n)/1_000_000_000)
 	}
-	keyMask := args[0]
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+	if n >= 1_000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1_000)
+	}
+	return strconv.FormatInt(n, 10)
+}
 
-	usage, err := b.db.GetWeeklyUsage(keyMask)
+// parseTimeWindow converts strings like "5h", "1d", "1w", "1m", "30d" to a duration.
+func parseTimeWindow(s string) (time.Duration, string) {
+	switch strings.ToLower(s) {
+	case "5h":
+		return 5 * time.Hour, "5 hours"
+	case "1d":
+		return 24 * time.Hour, "1 day"
+	case "7d", "1w":
+		return 7 * 24 * time.Hour, "1 week"
+	case "30d":
+		return 30 * 24 * time.Hour, "30 days"
+	case "1m":
+		return 30 * 24 * time.Hour, "1 month"
+	default:
+		// Try to parse as a Go duration
+		if d, err := time.ParseDuration(s); err == nil {
+			return d, s
+		}
+		return 30 * 24 * time.Hour, "30 days"
+	}
+}
+
+// resolveProvider finds a provider config by name across all plans and returns its key mask.
+func (b *Bot) resolveProvider(name string) (types.ProviderConfig, bool) {
+	plans, err := b.db.ListPlans()
 	if err != nil {
-		return fmt.Sprintf("Error fetching usage for *%s*.", keyMask)
+		return types.ProviderConfig{}, false
+	}
+	for _, plan := range plans {
+		for _, p := range plan.Providers {
+			if p.Name == name {
+				return p, true
+			}
+		}
+	}
+	return types.ProviderConfig{}, false
+}
+
+func (b *Bot) formatUsage(name string, usage *db.WeeklyUsage, window string) string {
+	return fmt.Sprintf("*%s* — %s\nRequests: %s\nTokens: %s (%s in / %s out)",
+		name, window, formatNumber(usage.RequestCount), formatNumber(usage.RequestTokens+usage.ResponseTokens),
+		formatNumber(usage.RequestTokens), formatNumber(usage.ResponseTokens))
+}
+
+func (b *Bot) cmdUsage(args []string) string {
+	// No args — show all providers with default 30-day usage
+	if len(args) == 0 {
+		plans, err := b.db.ListPlans()
+		if err != nil {
+			return "Error listing plans."
+		}
+
+		seen := make(map[string]bool)
+		var lines []string
+		lines = append(lines, "*Provider Usage (30d)*")
+
+		for _, plan := range plans {
+			for _, p := range plan.Providers {
+				if seen[p.Name] {
+					continue
+				}
+				seen[p.Name] = true
+				keyMask := types.MaskAPIKey(p.APIKey)
+				if keyMask == "" {
+					keyMask = p.Name
+				}
+				usage, _ := b.db.GetUsageSince(keyMask, time.Now().Add(-30*24*time.Hour))
+				if usage == nil || usage.RequestCount == 0 {
+					lines = append(lines, fmt.Sprintf("  `%s` — 0 req, 0 tok", p.Name))
+				} else {
+					lines = append(lines, fmt.Sprintf("  `%s` — %s req, %s tok", p.Name, formatNumber(usage.RequestCount), formatNumber(usage.RequestTokens+usage.ResponseTokens)))
+				}
+			}
+		}
+		return strings.Join(lines, "\n")
 	}
 
-	return fmt.Sprintf("*Weekly Usage: %s*\nRequests: %d\nTokens: %d (%d in / %d out)",
-		keyMask, usage.RequestCount, usage.RequestTokens+usage.ResponseTokens, usage.RequestTokens, usage.ResponseTokens)
+	name := args[0]
+
+	// Resolve provider name to key mask
+	provider, found := b.resolveProvider(name)
+	if !found {
+		return fmt.Sprintf("Provider *%s* not found.", name)
+	}
+	keyMask := types.MaskAPIKey(provider.APIKey)
+	if keyMask == "" {
+		keyMask = provider.Name
+	}
+
+	// Parse time window
+	duration, label := parseTimeWindow("30d")
+	if len(args) >= 2 {
+		duration, label = parseTimeWindow(args[1])
+	}
+
+	usage, err := b.db.GetUsageSince(keyMask, time.Now().Add(-duration))
+	if err != nil {
+		return fmt.Sprintf("Error fetching usage for *%s*: %v", name, err)
+	}
+
+	return b.formatUsage(name, usage, label)
 }
 
 func (b *Bot) cmdPlans() string {
@@ -427,7 +529,7 @@ func (b *Bot) cmdTop() string {
 		if it.requests > 0 {
 			pct = it.success * 100 / it.requests
 		}
-		lines = append(lines, fmt.Sprintf("%d. *%s* — %d req, %d tok, %d%% success", i+1, it.name, it.requests, it.tokens, pct))
+		lines = append(lines, fmt.Sprintf("%d. *%s* — %s req, %s tok, %d%% success", i+1, it.name, formatNumber(it.requests), formatNumber(it.tokens), pct))
 	}
 
 	return strings.Join(lines, "\n")
@@ -465,7 +567,7 @@ func (b *Bot) cmdHelp() string {
 /plan <slug> — Show plan config and provider health
 /health [provider] — Show health for all or specific provider
 /stats [plan] [provider] [limit] — Recent request stats
-/usage <key_mask> — Weekly token/request usage
+/usage [provider] [5h|1d|1w|30d|1m] — Token/request usage (default 30d, no args = all providers)
 /plans — List all plans with provider counts
 /status — Overall system status
 /top — Top providers by usage

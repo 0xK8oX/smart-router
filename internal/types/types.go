@@ -43,3 +43,11 @@ type StatRecord struct {
 	IsStreaming    bool   `json:"is_streaming"`
 	TargetProvider string `json:"target_provider,omitempty"`
 }
+
+// MaskAPIKey returns a masked version of an API key for display/logging.
+func MaskAPIKey(key string) string {
+	if len(key) <= 8 {
+		return "****"
+	}
+	return key[:4] + "****" + key[len(key)-4:]
+}

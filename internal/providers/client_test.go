@@ -57,7 +57,7 @@ func TestCallProvider(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, err := client.Call(provider, body)
+	resp, err := client.Call(provider, body, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestCallProviderAnthropicHeader(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, err := client.Call(provider, body)
+	resp, err := client.Call(provider, body, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestCallProviderTimeout(t *testing.T) {
 	}
 	body := map[string]interface{}{"model": "gpt-4"}
 
-	resp, err := client.Call(provider, body)
+	resp, err := client.Call(provider, body, nil)
 	if err == nil {
 		resp.Body.Close()
 		t.Fatal("expected timeout error, got nil")
@@ -153,7 +153,7 @@ func TestCallStream(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, err := client.CallStream(provider, body)
+	resp, err := client.CallStream(provider, body, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

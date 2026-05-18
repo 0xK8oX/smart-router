@@ -38,7 +38,7 @@ func New(tracker *health.HealthTracker, database *db.DB) *Router {
 // 6. If success (2xx): record success in health tracker, record stat in DB, return response
 // 7. If failure: read error body, record failure in health tracker, try next provider
 // 8. If all fail: return error
-func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming bool) (*http.Response, types.ProviderConfig, error) {
+func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header) (*http.Response, types.ProviderConfig, error) {
 	plan, err := r.db.GetPlan(planSlug)
 	if err != nil {
 		return nil, types.ProviderConfig{}, fmt.Errorf("load plan: %w", err)
@@ -80,7 +80,7 @@ func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming
 		translatedBody["model"] = provider.Model
 
 		// Translate request
-		translatedBody, err = translation.TranslateRequest(translatedBody, provider.Format)
+		translatedBody, err = translation.TranslateRequest(translatedBody, clientFormat, provider.Format)
 		if err != nil {
 			// Translation error is fatal for this provider, try next
 			_ = r.healthTracker.RecordFailure(provider.Name, 0, err.Error())
@@ -91,10 +91,14 @@ func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming
 		start := time.Now()
 
 		var resp *http.Response
+		var fwdHeaders http.Header
+		if clientFormat == provider.Format {
+			fwdHeaders = headers
+		}
 		if isStreaming {
-			resp, err = r.client.CallStream(provider, translatedBody)
+			resp, err = r.client.CallStream(provider, translatedBody, fwdHeaders)
 		} else {
-			resp, err = r.client.Call(provider, translatedBody)
+			resp, err = r.client.Call(provider, translatedBody, fwdHeaders)
 		}
 
 		if err != nil {
@@ -106,6 +110,7 @@ func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming
 				Plan:        planSlug,
 				Provider:    provider.Name,
 				Model:       provider.Model,
+				KeyMask:     types.MaskAPIKey(provider.APIKey),
 				Status:      "failure",
 				LatencyMs:   latencyMs,
 				IsStreaming: isStreaming,
@@ -115,17 +120,8 @@ func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			// Success
-			latencyMs := time.Since(start).Milliseconds()
+			// Success — health tracker updated; stat with token counts recorded by handler.
 			_ = r.healthTracker.RecordSuccess(provider.Name)
-			_ = r.db.RecordStat(types.StatRecord{
-				Plan:        planSlug,
-				Provider:    provider.Name,
-				Model:       provider.Model,
-				Status:      "success",
-				LatencyMs:   latencyMs,
-				IsStreaming: isStreaming,
-			})
 			return resp, provider, nil
 		}
 

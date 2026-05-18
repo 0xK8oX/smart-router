@@ -42,20 +42,25 @@ func isNativeAnthropic(baseURL string) bool {
 	return bytes.Contains([]byte(baseURL), []byte("api.anthropic.com"))
 }
 
-// Call makes a non-streaming request to the provider.
-func (c *Client) Call(provider types.ProviderConfig, body map[string]interface{}) (*http.Response, error) {
+func (c *Client) doRequest(provider types.ProviderConfig, body map[string]interface{}, ctx context.Context, headers http.Header) (*http.Response, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request body: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(provider.Timeout)*time.Second)
-	_ = cancel // context auto-cancels after timeout; don't cancel early or streaming body closes
-
 	endpoint := buildEndpoint(provider.BaseURL, provider.Format)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	// Forward original headers when in passthrough mode (clientFormat == provider.Format).
+	if headers != nil {
+		for k, vv := range headers {
+			for _, v := range vv {
+				req.Header.Add(k, v)
+			}
+		}
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -82,8 +87,19 @@ func (c *Client) Call(provider types.ProviderConfig, body map[string]interface{}
 	return resp, nil
 }
 
+// Call makes a non-streaming request to the provider.
+// headers is forwarded as-is when clientFormat == provider.Format (passthrough mode).
+func (c *Client) Call(provider types.ProviderConfig, body map[string]interface{}, headers http.Header) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(provider.Timeout)*time.Second)
+	_ = cancel // don't cancel early — caller needs to read response body
+	return c.doRequest(provider, body, ctx, headers)
+}
+
 // CallStream makes a streaming request (sets stream=true in body).
-func (c *Client) CallStream(provider types.ProviderConfig, body map[string]interface{}) (*http.Response, error) {
+// No hard timeout — streams can run indefinitely. The router's handler
+// timeout and upstream provider behavior are the natural boundaries.
+// headers is forwarded as-is when clientFormat == provider.Format (passthrough mode).
+func (c *Client) CallStream(provider types.ProviderConfig, body map[string]interface{}, headers http.Header) (*http.Response, error) {
 	body["stream"] = true
-	return c.Call(provider, body)
+	return c.doRequest(provider, body, context.Background(), headers)
 }

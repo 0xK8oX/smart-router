@@ -13,7 +13,7 @@ func TestTranslateRequestAnthropicMaxTokens(t *testing.T) {
 		},
 	}
 
-	result, err := TranslateRequest(body, "anthropic")
+	result, err := TranslateRequest(body, "openai", "anthropic")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestTranslateRequestOpenAIPassthrough(t *testing.T) {
 		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
 	}
 
-	result, err := TranslateRequest(body, "openai")
+	result, err := TranslateRequest(body, "openai", "openai")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestTranslateRequestAnthropicSystemMessage(t *testing.T) {
 		},
 	}
 
-	result, err := TranslateRequest(body, "anthropic")
+	result, err := TranslateRequest(body, "openai", "anthropic")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -130,13 +130,17 @@ func TestTranslateRequestAnthropicTools(t *testing.T) {
 		"tool_choice": "auto",
 	}
 
-	result, err := TranslateRequest(body, "anthropic")
+	result, err := TranslateRequest(body, "openai", "anthropic")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if _, ok := result["tool_choice"]; ok {
-		t.Fatal("expected tool_choice to be removed")
+	tc, ok := result["tool_choice"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected tool_choice to be translated, got %T", result["tool_choice"])
+	}
+	if tc["type"] != "auto" {
+		t.Fatalf("expected tool_choice type=auto, got %v", tc["type"])
 	}
 
 	tools, ok := result["tools"].([]interface{})
