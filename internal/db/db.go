@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -40,6 +41,7 @@ type DB struct {
 	conn     *sql.DB
 	statChan chan types.StatRecord
 	stopChan chan struct{}
+	wg       sync.WaitGroup
 }
 
 func Open(path string) (*DB, error) {
@@ -51,6 +53,15 @@ func Open(path string) (*DB, error) {
 	if err := conn.Ping(); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("ping sqlite: %w", err)
+	}
+
+	if _, err := conn.Exec(`PRAGMA journal_mode=WAL;`); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("enable wal: %w", err)
+	}
+	if _, err := conn.Exec(`PRAGMA busy_timeout=5000;`); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("set busy timeout: %w", err)
 	}
 
 	db := &DB{
@@ -77,41 +88,92 @@ func (d *DB) migrate() error {
 }
 
 func (d *DB) RecordStat(r types.StatRecord) error {
-	streaming := 0
-	if r.IsStreaming {
-		streaming = 1
+	return d.RecordStatBatch([]types.StatRecord{r})
+}
+
+func (d *DB) RecordStatBatch(records []types.StatRecord) error {
+	if len(records) == 0 {
+		return nil
 	}
 
-	_, err := d.conn.Exec(`
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin batch tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
 		INSERT INTO request_stats
 			(plan, provider, model, key_mask, request_tokens, response_tokens, total_tokens, status, latency_ms, is_streaming, target_provider)
 		VALUES
 			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, r.Plan, r.Provider, r.Model, r.KeyMask, r.RequestTokens, r.ResponseTokens, r.TotalTokens, r.Status, r.LatencyMs, streaming, r.TargetProvider)
-
+	`)
 	if err != nil {
-		return fmt.Errorf("insert stat: %w", err)
+		return fmt.Errorf("prepare batch stmt: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, r := range records {
+		streaming := 0
+		if r.IsStreaming {
+			streaming = 1
+		}
+		if _, err := stmt.Exec(
+			r.Plan, r.Provider, r.Model, r.KeyMask,
+			r.RequestTokens, r.ResponseTokens, r.TotalTokens,
+			r.Status, r.LatencyMs, streaming, r.TargetProvider,
+		); err != nil {
+			return fmt.Errorf("exec batch insert: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit batch tx: %w", err)
 	}
 	return nil
 }
 
 func (d *DB) startStatWorker() {
+	d.wg.Add(1)
 	go func() {
+		defer d.wg.Done()
+		const batchSize = 50
+		batch := make([]types.StatRecord, 0, batchSize)
+
+		flush := func() {
+			if len(batch) == 0 {
+				return
+			}
+			if err := d.RecordStatBatch(batch); err != nil {
+				log.Printf("[DB] batch stat insert failed: %v", err)
+			}
+			batch = batch[:0]
+		}
+
+	outer:
 		for {
-			select {
-			case r := <-d.statChan:
-				if err := d.RecordStat(r); err != nil {
-					log.Printf("[DB] async stat insert failed: %v", err)
-				}
-			case <-d.stopChan:
+				select {
+				case r := <-d.statChan:
+					batch = append(batch, r)
+					// Non-blocking drain to fill batch
+					for len(batch) < batchSize {
+						select {
+						case r2 := <-d.statChan:
+							batch = append(batch, r2)
+						default:
+							flush()
+							continue outer
+						}
+					}
+					flush()
+				case <-d.stopChan:
 				// Drain remaining stats before exiting
 				for {
 					select {
 					case r := <-d.statChan:
-						if err := d.RecordStat(r); err != nil {
-							log.Printf("[DB] flush stat insert failed: %v", err)
-						}
+						batch = append(batch, r)
 					default:
+						flush()
 						return
 					}
 				}
@@ -266,7 +328,29 @@ func (d *DB) DeletePlan(slug string) error {
 
 func (d *DB) Close() error {
 	close(d.stopChan)
+	d.wg.Wait()
 	return d.conn.Close()
+}
+
+// FlushStats drains the async stat channel, writing any pending records
+// synchronously, then pauses briefly to let the background worker finish
+// any in-flight insert. Intended for use in tests.
+func (d *DB) FlushStats() {
+	batch := make([]types.StatRecord, 0, 50)
+	for {
+		select {
+		case r := <-d.statChan:
+			batch = append(batch, r)
+		default:
+			if len(batch) > 0 {
+				if err := d.RecordStatBatch(batch); err != nil {
+					log.Printf("[DB] flush stat insert failed: %v", err)
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+			return
+		}
+	}
 }
 
 type WeeklyUsage struct {

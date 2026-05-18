@@ -167,6 +167,7 @@ func TestRouteFailover(t *testing.T) {
 
 	// Verify failure stat recorded for the first (bad) provider.
 	// Success stats are recorded by the HTTP handler, not the router.
+	database.FlushStats()
 	stats, err := database.GetStats("pro", "", 10)
 	if err != nil {
 		t.Fatalf("get stats: %v", err)
@@ -240,6 +241,7 @@ func TestRouteAllFail(t *testing.T) {
 	}
 
 	// Verify failure stat recorded
+	database.FlushStats()
 	stats, err := database.GetStats("pro", "", 10)
 	if err != nil {
 		t.Fatalf("get stats: %v", err)

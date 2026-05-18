@@ -30,6 +30,7 @@ type HealthTracker struct {
 	dirty map[string]bool
 	mu    sync.RWMutex
 	stop  chan struct{}
+	wg    sync.WaitGroup
 }
 
 func New(path string) (*HealthTracker, error) {
@@ -51,6 +52,7 @@ func New(path string) (*HealthTracker, error) {
 
 func (h *HealthTracker) Close() error {
 	close(h.stop)
+	h.wg.Wait()
 	h.flush()
 	return h.db.Close()
 }
@@ -138,13 +140,21 @@ func (h *HealthTracker) RecordSuccess(provider string) error {
 }
 
 func (h *HealthTracker) startFlushWorker() {
+	h.wg.Add(1)
 	go func() {
+		defer h.wg.Done()
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
 				h.flush()
+				// If flush was slow, discard any accumulated tick
+				// so we don't flush back-to-back.
+				select {
+				case <-ticker.C:
+				default:
+				}
 			case <-h.stop:
 				return
 			}
@@ -165,17 +175,20 @@ func (h *HealthTracker) flush() {
 		return
 	}
 
-	for name, health := range toFlush {
-		data, err := json.Marshal(health)
-		if err != nil {
-			log.Printf("[HEALTH] marshal failed for %s: %v", name, err)
-			continue
+	if err := h.db.Update(func(txn *badger.Txn) error {
+		for name, health := range toFlush {
+			data, err := json.Marshal(health)
+			if err != nil {
+				log.Printf("[HEALTH] marshal failed for %s: %v", name, err)
+				continue
+			}
+			if err := txn.Set(key(name), data); err != nil {
+				return err
+			}
 		}
-		if err := h.db.Update(func(txn *badger.Txn) error {
-			return txn.Set(key(name), data)
-		}); err != nil {
-			log.Printf("[HEALTH] flush failed for %s: %v", name, err)
-		}
+		return nil
+	}); err != nil {
+		log.Printf("[HEALTH] flush failed: %v", err)
 	}
 }
 

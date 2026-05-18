@@ -227,6 +227,13 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 		if err != nil {
 			// Translation error is fatal for this provider, try next
 			_ = r.healthTracker.RecordFailure(provider.Name, 0, err.Error())
+			r.db.RecordStatAsync(types.StatRecord{
+				Plan:     planSlug,
+				Provider: provider.Name,
+				Model:    provider.Model,
+				KeyMask:  types.MaskAPIKey(provider.APIKey),
+				Status:   "failure",
+			})
 			providerErrors = append(providerErrors, fmt.Sprintf("%s: translate error", provider.Name))
 			continue
 		}
@@ -271,10 +278,10 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 			return resp, provider, nil
 		}
 
-		// Failure: read body, record failure, try next
+		// Failure: read body (bounded), record failure, try next
 		var errBody string
 		if resp.Body != nil {
-			b, _ := io.ReadAll(resp.Body)
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			errBody = string(b)
 			resp.Body.Close()
 		}
@@ -282,10 +289,11 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 		latencyMs := time.Since(start).Milliseconds()
 		log.Printf("[ROUTER] FAILURE: plan=%s provider=%s status=%d body=%.200s latency=%dms", planSlug, provider.Name, resp.StatusCode, errBody, latencyMs)
 		_ = r.healthTracker.RecordFailure(provider.Name, resp.StatusCode, errBody)
-		_ = r.db.RecordStat(types.StatRecord{
+		r.db.RecordStatAsync(types.StatRecord{
 			Plan:        planSlug,
 			Provider:    provider.Name,
 			Model:       provider.Model,
+			KeyMask:     types.MaskAPIKey(provider.APIKey),
 			Status:      "failure",
 			LatencyMs:   latencyMs,
 			IsStreaming: isStreaming,
