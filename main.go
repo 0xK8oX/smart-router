@@ -55,6 +55,7 @@ func main() {
 	if err := api.SeedPlansFromFile(database, configPath); err != nil {
 		log.Printf("warning: failed to seed plans: %v", err)
 	}
+	r.InvalidateAllPlanCache()
 
 	server := api.NewServer(r, ht, database, adminKey)
 

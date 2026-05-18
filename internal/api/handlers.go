@@ -543,6 +543,7 @@ func (s *Server) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.router.InvalidatePlanCache(slug)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -563,6 +564,7 @@ func (s *Server) handleDeletePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.router.InvalidatePlanCache(slug)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

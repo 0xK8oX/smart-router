@@ -12,9 +12,11 @@ type ProviderConfig struct {
 	WeeklyReqLimit    *uint64 `json:"weekly_request_limit,omitempty" yaml:"weekly_request_limit,omitempty"`
 	ContextLength     *int    `json:"context_length,omitempty" yaml:"context_length,omitempty"`
 	MaxOutputTokens   *int    `json:"max_output_tokens,omitempty" yaml:"max_output_tokens,omitempty"`
+	Weight            int     `json:"weight,omitempty" yaml:"weight,omitempty"`
 }
 
 type PlanConfig struct {
+	Strategy  string           `json:"strategy,omitempty" yaml:"strategy,omitempty"`
 	Providers []ProviderConfig `json:"providers" yaml:"providers"`
 }
 
