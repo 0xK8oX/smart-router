@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -178,7 +179,52 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		log.Printf("streaming: ResponseWriter does not support flushing")
+	}
+	const maxCapture = 32 * 1024
+	var captured []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := bodyReader.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if ok {
+				flusher.Flush()
+			}
+			captured = append(captured, buf[:n]...)
+			if len(captured) > maxCapture {
+				captured = captured[len(captured)-maxCapture:]
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("streaming read error: %v", err)
+			}
+			latencyMs := time.Since(start).Milliseconds()
+			reqTokens, respTokens := extractUsageFromStream(captured, clientFormat)
+			_ = s.db.RecordStat(types.StatRecord{
+				Plan:           planSlug,
+				Provider:       provider.Name,
+				Model:          provider.Model,
+				KeyMask:        types.MaskAPIKey(provider.APIKey),
+				RequestTokens:  reqTokens,
+				ResponseTokens: respTokens,
+				TotalTokens:    reqTokens + respTokens,
+				Status:         "success",
+				LatencyMs:      latencyMs,
+				IsStreaming:    true,
+			})
+			return
+		}
+	}
+}
+
+func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, clientFormat string) {
 	start := time.Now()
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
@@ -216,7 +262,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		isStreaming = stream
 	}
 
-	resp, provider, err := s.router.Route(planSlug, body, isStreaming, "openai", r.Header)
+	resp, provider, err := s.router.Route(planSlug, body, isStreaming, clientFormat, r.Header)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
@@ -231,60 +277,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isStreaming {
-		// Remove Content-Length for streaming — the size is unknown and
-		// a zero/invalid value causes clients to skip reading the body.
 		w.Header().Del("Content-Length")
 		w.Header().Del("Content-Encoding")
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(resp.StatusCode)
+
 		var bodyReader io.Reader = resp.Body
-		if provider.Format != "openai" {
-			bodyReader = translation.SSETranslator(resp.Body, provider.Format, "openai")
+		if provider.Format != clientFormat {
+			bodyReader = translation.SSETranslator(resp.Body, provider.Format, clientFormat)
 		}
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			log.Printf("streaming: ResponseWriter does not support flushing")
-		}
-		// Capture last 32KB of stream to scan for usage in final chunks.
-		const maxCapture = 32 * 1024
-		var captured []byte
-		buf := make([]byte, 4096)
-		for {
-			n, err := bodyReader.Read(buf)
-			if n > 0 {
-				if _, werr := w.Write(buf[:n]); werr != nil {
-					return
-				}
-				if ok {
-					flusher.Flush()
-				}
-				captured = append(captured, buf[:n]...)
-				if len(captured) > maxCapture {
-					captured = captured[len(captured)-maxCapture:]
-				}
-			}
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("streaming read error: %v", err)
-				}
-				latencyMs := time.Since(start).Milliseconds()
-				reqTokens, respTokens := extractUsageFromStream(captured, "openai")
-				_ = s.db.RecordStat(types.StatRecord{
-					Plan:           planSlug,
-					Provider:       provider.Name,
-					Model:          provider.Model,
-					KeyMask:        types.MaskAPIKey(provider.APIKey),
-					RequestTokens:  reqTokens,
-					ResponseTokens: respTokens,
-					TotalTokens:    reqTokens + respTokens,
-					Status:         "success",
-					LatencyMs:      latencyMs,
-					IsStreaming:    true,
-				})
-				return
-			}
-		}
+		s.proxyStream(w, bodyReader, planSlug, provider, start, clientFormat)
+		return
 	}
 
 	data, err := io.ReadAll(resp.Body)
@@ -294,146 +298,29 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if provider.Format != "openai" {
-		data, err = translation.TranslateResponse(data, provider.Format, "openai")
+	if provider.Format != clientFormat {
+		data, err = translation.TranslateResponse(data, provider.Format, clientFormat)
 		if err != nil {
 			log.Printf("translate response error: %v", err)
 		}
 	}
 
 	latencyMs := time.Since(start).Milliseconds()
-	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, "openai")
+	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(data)
 }
 
+func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	s.handleCompletion(w, r, "openai")
+}
+
 // handleMessages accepts Anthropic Messages API format, translates to OpenAI,
 // routes through the plan, then translates the response back to Anthropic format.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	body := make(map[string]interface{})
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-
-	planSlug := r.Header.Get("X-Plan")
-	if planSlug == "" {
-		planSlug = "default"
-	}
-
-	// Support plan/model syntax in the model field
-	if model, ok := body["model"].(string); ok && strings.Contains(model, "/") {
-		parts := strings.SplitN(model, "/", 2)
-		if len(parts) == 2 {
-			planSlug = parts[0]
-			body["model"] = parts[1]
-		}
-	}
-
-	isStreaming := false
-	if stream, ok := body["stream"].(bool); ok {
-		isStreaming = stream
-	}
-
-	resp, provider, err := s.router.Route(planSlug, body, isStreaming, "anthropic", r.Header)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	defer resp.Body.Close()
-
-	// Copy response headers
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-
-	if isStreaming {
-		w.Header().Del("Content-Length")
-		w.Header().Del("Content-Encoding")
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(resp.StatusCode)
-
-		var bodyReader io.Reader = resp.Body
-		if provider.Format != "anthropic" {
-			bodyReader = translation.SSETranslator(resp.Body, provider.Format, "anthropic")
-		}
-
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			log.Printf("streaming: ResponseWriter does not support flushing")
-		}
-		// Capture last 32KB of stream to scan for usage in final chunks.
-		const maxCapture = 32 * 1024
-		var captured []byte
-		buf := make([]byte, 4096)
-		for {
-			n, err := bodyReader.Read(buf)
-			if n > 0 {
-				if _, werr := w.Write(buf[:n]); werr != nil {
-					return
-				}
-				if ok {
-					flusher.Flush()
-				}
-				captured = append(captured, buf[:n]...)
-				if len(captured) > maxCapture {
-					captured = captured[len(captured)-maxCapture:]
-				}
-			}
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("streaming read error: %v", err)
-				}
-				latencyMs := time.Since(start).Milliseconds()
-				reqTokens, respTokens := extractUsageFromStream(captured, "anthropic")
-				_ = s.db.RecordStat(types.StatRecord{
-					Plan:           planSlug,
-					Provider:       provider.Name,
-					Model:          provider.Model,
-					KeyMask:        types.MaskAPIKey(provider.APIKey),
-					RequestTokens:  reqTokens,
-					ResponseTokens: respTokens,
-					TotalTokens:    reqTokens + respTokens,
-					Status:         "success",
-					LatencyMs:      latencyMs,
-					IsStreaming:    true,
-				})
-				return
-			}
-		}
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("read response body error: %v", err)
-		writeError(w, http.StatusInternalServerError, "failed to read response")
-		return
-	}
-
-	if provider.Format != "anthropic" {
-		data, err = translation.TranslateResponse(data, provider.Format, "anthropic")
-		if err != nil {
-			log.Printf("translate response error: %v", err)
-		}
-	}
-
-	latencyMs := time.Since(start).Milliseconds()
-	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, "anthropic")
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	w.Write(data)
+	s.handleCompletion(w, r, "anthropic")
 }
 
 // Static model list for Anthropic-compatible clients (Claude Code, etc.)
@@ -669,13 +556,9 @@ func (s *Server) handleHealthActivity(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Sort by last activity descending
-	for i := 0; i < len(activities)-1; i++ {
-		for j := i + 1; j < len(activities); j++ {
-			if activities[j].LastActivityAt > activities[i].LastActivityAt {
-				activities[i], activities[j] = activities[j], activities[i]
-			}
-		}
-	}
+	sort.Slice(activities, func(i, j int) bool {
+		return activities[i].LastActivityAt > activities[j].LastActivityAt
+	})
 
 	writeJSON(w, http.StatusOK, activities)
 }

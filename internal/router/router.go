@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -91,7 +92,7 @@ const maxVirtualDepth = 3
 const smartPrefix = "smart://"
 
 func isVirtualProvider(baseURL string) bool {
-	return len(baseURL) > len(smartPrefix) && baseURL[:len(smartPrefix)] == smartPrefix
+	return strings.HasPrefix(baseURL, smartPrefix)
 }
 
 func extractPlanFromURL(baseURL string) string {
@@ -148,7 +149,6 @@ func (r *Router) applyStrategy(planSlug string, strategy string, providers []typ
 		return append(append([]types.ProviderConfig{}, providers[startIdx:]...), providers[:startIdx]...)
 	case "lru":
 		r.mu.Lock()
-		defer r.mu.Unlock()
 		sorted := make([]types.ProviderConfig, len(providers))
 		copy(sorted, providers)
 		sort.Slice(sorted, func(i, j int) bool {
@@ -156,6 +156,7 @@ func (r *Router) applyStrategy(planSlug string, strategy string, providers []typ
 			lj := r.lastUsed[sorted[j].Name]
 			return li.Before(lj) || li.Equal(lj)
 		})
+		r.mu.Unlock()
 		return sorted
 	default:
 		return providers
@@ -185,6 +186,7 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 	orderedProviders = append(orderedProviders, remaining...)
 
 	var providerErrors []string
+	now := time.Now().Unix()
 
 	for _, provider := range orderedProviders {
 		// Virtual provider: route internally to another plan instead of making an HTTP call.
@@ -208,7 +210,7 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 			// If we can't read health, treat as healthy and proceed
 			h = types.ProviderHealth{}
 		}
-		if h.Status == "unhealthy" && h.CooldownUntil > time.Now().Unix() {
+		if h.Status == "unhealthy" && h.CooldownUntil > now {
 			providerErrors = append(providerErrors, fmt.Sprintf("%s: unhealthy (cooldown)", provider.Name))
 			continue
 		}

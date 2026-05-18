@@ -6,13 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"regexp"
+	"strings"
 	"time"
 
 	"smart-router/internal/types"
 )
-
-var versionSuffix = regexp.MustCompile(`/v\d+$`)
 
 // Client is an HTTP client for calling upstream LLM providers.
 type Client struct {
@@ -27,7 +25,7 @@ func NewClient() *Client {
 }
 
 func buildEndpoint(baseURL string, format string) string {
-	base := versionSuffix.ReplaceAllString(baseURL, "")
+	base := strings.TrimSuffix(baseURL, "/v1")
 	if format == "anthropic" {
 		return base + "/v1/messages"
 	}
@@ -35,11 +33,11 @@ func buildEndpoint(baseURL string, format string) string {
 }
 
 func isKimiCodingEndpoint(baseURL string) bool {
-	return bytes.Contains([]byte(baseURL), []byte("api.kimi.com")) && bytes.Contains([]byte(baseURL), []byte("/coding"))
+	return strings.Contains(baseURL, "api.kimi.com") && strings.Contains(baseURL, "/coding")
 }
 
 func isNativeAnthropic(baseURL string) bool {
-	return bytes.Contains([]byte(baseURL), []byte("api.anthropic.com"))
+	return strings.Contains(baseURL, "api.anthropic.com")
 }
 
 func (c *Client) doRequest(provider types.ProviderConfig, body map[string]interface{}, ctx context.Context, headers http.Header) (*http.Response, error) {
