@@ -186,7 +186,7 @@ func (b *Bot) cmdPlan(args []string) string {
 			lines = append(lines, fmt.Sprintf("    failures=%d reason=%s", h.ConsecutiveFailures, h.LastFailureReason))
 		}
 		if mask != p.Name {
-			usage, _ := b.db.GetWeeklyUsage(mask)
+			usage, _ := b.db.GetWeeklyUsageForPlan(slug, mask)
 			if usage != nil {
 				lines = append(lines, fmt.Sprintf("    weekly: %s req, %s tok", formatNumber(usage.RequestCount), formatNumber(usage.RequestTokens+usage.ResponseTokens)))
 			}

@@ -248,7 +248,32 @@ func (d *DB) GetUsageSince(keyMask string, since time.Time) (*WeeklyUsage, error
 	}, nil
 }
 
+// GetUsageSinceForPlan returns token and request counts for a provider/key_mask within a specific plan since the given time.
+func (d *DB) GetUsageSinceForPlan(plan, keyMask string, since time.Time) (*WeeklyUsage, error) {
+	var reqTokens, respTokens, reqCount sql.NullInt64
+	err := d.conn.QueryRow(`
+		SELECT COALESCE(SUM(request_tokens), 0), COALESCE(SUM(response_tokens), 0), COALESCE(COUNT(*), 0)
+		FROM request_stats
+		WHERE plan = ? AND key_mask = ? AND created_at > ? AND status = 'success'
+	`, plan, keyMask, since.UnixMilli()).Scan(&reqTokens, &respTokens, &reqCount)
+
+	if err != nil {
+		return nil, fmt.Errorf("query usage: %w", err)
+	}
+
+	return &WeeklyUsage{
+		RequestTokens:  reqTokens.Int64,
+		ResponseTokens: respTokens.Int64,
+		RequestCount:   reqCount.Int64,
+	}, nil
+}
+
 // GetWeeklyUsage returns token and request counts for a provider/key_mask over the last 7 days.
 func (d *DB) GetWeeklyUsage(keyMask string) (*WeeklyUsage, error) {
 	return d.GetUsageSince(keyMask, time.Now().Add(-7*24*time.Hour))
+}
+
+// GetWeeklyUsageForPlan returns token and request counts for a provider/key_mask within a specific plan over the last 7 days.
+func (d *DB) GetWeeklyUsageForPlan(plan, keyMask string) (*WeeklyUsage, error) {
+	return d.GetUsageSinceForPlan(plan, keyMask, time.Now().Add(-7*24*time.Hour))
 }
