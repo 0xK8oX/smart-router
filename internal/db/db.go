@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -36,7 +37,9 @@ var migrations = []string{
 }
 
 type DB struct {
-	conn *sql.DB
+	conn     *sql.DB
+	statChan chan types.StatRecord
+	stopChan chan struct{}
 }
 
 func Open(path string) (*DB, error) {
@@ -50,12 +53,17 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
 
-	db := &DB{conn: conn}
+	db := &DB{
+		conn:     conn,
+		statChan: make(chan types.StatRecord, 1000),
+		stopChan: make(chan struct{}),
+	}
 	if err := db.migrate(); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
+	db.startStatWorker()
 	return db, nil
 }
 
@@ -85,6 +93,44 @@ func (d *DB) RecordStat(r types.StatRecord) error {
 		return fmt.Errorf("insert stat: %w", err)
 	}
 	return nil
+}
+
+func (d *DB) startStatWorker() {
+	go func() {
+		for {
+			select {
+			case r := <-d.statChan:
+				if err := d.RecordStat(r); err != nil {
+					log.Printf("[DB] async stat insert failed: %v", err)
+				}
+			case <-d.stopChan:
+				// Drain remaining stats before exiting
+				for {
+					select {
+					case r := <-d.statChan:
+						if err := d.RecordStat(r); err != nil {
+							log.Printf("[DB] flush stat insert failed: %v", err)
+						}
+					default:
+						return
+					}
+				}
+			}
+		}
+	}()
+}
+
+// RecordStatAsync sends a stat record to the background worker.
+// If the channel is full, it falls back to synchronous insertion.
+func (d *DB) RecordStatAsync(r types.StatRecord) {
+	select {
+	case d.statChan <- r:
+	default:
+		// Channel full — write synchronously so we don't drop stats
+		if err := d.RecordStat(r); err != nil {
+			log.Printf("[DB] sync stat insert failed: %v", err)
+		}
+	}
 }
 
 func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, error) {
@@ -219,6 +265,7 @@ func (d *DB) DeletePlan(slug string) error {
 }
 
 func (d *DB) Close() error {
+	close(d.stopChan)
 	return d.conn.Close()
 }
 

@@ -249,7 +249,7 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 			latencyMs := time.Since(start).Milliseconds()
 			log.Printf("[ROUTER] FAILURE: plan=%s provider=%s error=%v latency=%dms", planSlug, provider.Name, err, latencyMs)
 			_ = r.healthTracker.RecordFailure(provider.Name, 0, err.Error())
-			_ = r.db.RecordStat(types.StatRecord{
+			r.db.RecordStatAsync(types.StatRecord{
 				Plan:        planSlug,
 				Provider:    provider.Name,
 				Model:       provider.Model,

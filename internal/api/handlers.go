@@ -153,7 +153,7 @@ func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig
 	if len(data) > 0 {
 		reqTokens, respTokens = extractUsage(data, clientFormat)
 	}
-	_ = db.RecordStat(types.StatRecord{
+	db.RecordStatAsync(types.StatRecord{
 		Plan:           planSlug,
 		Provider:       provider.Name,
 		Model:          provider.Model,
@@ -207,7 +207,7 @@ func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSl
 			}
 			latencyMs := time.Since(start).Milliseconds()
 			reqTokens, respTokens := extractUsageFromStream(captured, clientFormat)
-			_ = s.db.RecordStat(types.StatRecord{
+			s.db.RecordStatAsync(types.StatRecord{
 				Plan:           planSlug,
 				Provider:       provider.Name,
 				Model:          provider.Model,
