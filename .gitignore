@@ -7,8 +7,9 @@ dist/
 .wrangler/
 .worktrees
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 health.db/
 data/
 smart-router
-data/
-health.db/

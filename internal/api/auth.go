@@ -97,6 +97,10 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 
 		token := auth.ParseBearerToken(r.Header.Get("Authorization"))
 		if token == "" {
+			// Anthropic clients send x-api-key instead of Authorization: Bearer
+			token = r.Header.Get("x-api-key")
+		}
+		if token == "" {
 			writeError(w, http.StatusUnauthorized, "missing Authorization header")
 			return
 		}

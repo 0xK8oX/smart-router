@@ -7,7 +7,37 @@ import (
 )
 
 func TestLoadPlans(t *testing.T) {
-	cfg, err := LoadFromFile("../../config/plans.yaml")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plans.yaml")
+	content := `plans:
+  test:
+    name: "Test Plan"
+    strategy: "latency"
+    rate_limit_rpm: 10
+    rate_limit_rpd: 100
+    providers:
+      - name: "p1"
+        base_url: "http://localhost:23000/v1"
+        model: "auto"
+        format: "openai"
+        api_key: "sk-test"
+        timeout: 60
+        weight: 1
+        enabled: true
+      - name: "p2"
+        base_url: "http://localhost:8080/v1"
+        model: "m2"
+        format: "anthropic"
+        api_key: "sk-test2"
+        timeout: 30
+        weight: 2
+        enabled: false
+`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	cfg, err := LoadFromFile(path)
 	if err != nil {
 		t.Fatalf("LoadFromFile failed: %v", err)
 	}
@@ -20,13 +50,13 @@ func TestLoadPlans(t *testing.T) {
 		t.Fatal("expected at least 1 plan")
 	}
 
-	jasonPlan, ok := cfg.Plans["jason"]
+	testPlan, ok := cfg.Plans["test"]
 	if !ok {
-		t.Fatal("expected 'jason' plan to exist")
+		t.Fatal("expected 'test' plan to exist")
 	}
 
-	if len(jasonPlan.Providers) != 5 {
-		t.Fatalf("expected 5 providers in 'jason' plan, got %d", len(jasonPlan.Providers))
+	if len(testPlan.Providers) != 2 {
+		t.Fatalf("expected 2 providers in 'test' plan, got %d", len(testPlan.Providers))
 	}
 
 	expectedProviders := []struct {
@@ -36,15 +66,12 @@ func TestLoadPlans(t *testing.T) {
 		format  string
 		timeout int
 	}{
-		{"jason-kimi-2", "https://api.kimi.com/coding/", "k2p6", "anthropic", 60},
-		{"jason-kimi", "https://api.kimi.com/coding/", "k2p6", "anthropic", 60},
-		{"jason-kimi-debbie", "https://api.kimi.com/coding/", "k2p6", "anthropic", 60},
-		{"jason-volcengine", "https://ark.cn-beijing.volces.com/api/coding", "kimi-k2.6", "anthropic", 60},
-		{"jason-minimax", "https://api.minimaxi.com/anthropic", "minimax2.7", "anthropic", 60},
+		{"p1", "http://localhost:23000/v1", "auto", "openai", 60},
+		{"p2", "http://localhost:8080/v1", "m2", "anthropic", 30},
 	}
 
 	for i, exp := range expectedProviders {
-		p := jasonPlan.Providers[i]
+		p := testPlan.Providers[i]
 		if p.Name != exp.name {
 			t.Errorf("provider[%d].Name = %q, want %q", i, p.Name, exp.name)
 		}

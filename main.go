@@ -67,6 +67,7 @@ func main() {
 	if count, err := database.CountAPIKeys(); err != nil {
 		log.Printf("warning: failed to count api keys: %v", err)
 	} else if count == 0 {
+		log.Printf("WARNING: Database has 0 API keys. If this is unexpected, restore from data/backups/")
 		defaultKey := types.APIKey{
 			Key:       auth.GenerateAPIKey(),
 			Name:      "default",

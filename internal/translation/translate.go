@@ -339,6 +339,9 @@ func TranslateResponse(data []byte, fromFormat, toFormat string) ([]byte, error)
 	if fromFormat == "anthropic" && toFormat == "openai" {
 		return translateAnthropicToOpenAI(data)
 	}
+	if fromFormat == "openai" && toFormat == "anthropic" {
+		return translateOpenAIToAnthropic(data)
+	}
 	return data, nil
 }
 
@@ -465,4 +468,95 @@ func translateAnthropicToOpenAI(data []byte) ([]byte, error) {
 	}
 
 	return json.Marshal(openai)
+}
+
+func translateOpenAIToAnthropic(data []byte) ([]byte, error) {
+	var openai struct {
+		ID      string `json:"id"`
+		Model   string `json:"model"`
+		Choices []struct {
+			Message      struct {
+				Role       string `json:"role"`
+				Content    interface{} `json:"content"`
+				ToolCalls  []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(data, &openai); err != nil {
+		return data, err
+	}
+
+	var content []map[string]interface{}
+	if len(openai.Choices) > 0 {
+		msg := openai.Choices[0].Message
+		if text, ok := msg.Content.(string); ok {
+			content = append(content, map[string]interface{}{
+				"type": "text",
+				"text": text,
+			})
+		} else if arr, ok := msg.Content.([]interface{}); ok {
+			for _, item := range arr {
+				if block, ok := item.(map[string]interface{}); ok {
+					content = append(content, block)
+				}
+			}
+		}
+		for _, tc := range msg.ToolCalls {
+			var input map[string]interface{}
+			if tc.Function.Arguments != "" {
+				_ = json.Unmarshal([]byte(tc.Function.Arguments), &input)
+			}
+			if input == nil {
+				input = map[string]interface{}{}
+			}
+			content = append(content, map[string]interface{}{
+				"type":  "tool_use",
+				"id":    tc.ID,
+				"name":  tc.Function.Name,
+				"input": input,
+			})
+		}
+	}
+
+	stopReason := "end_turn"
+	if len(openai.Choices) > 0 {
+		fr := openai.Choices[0].FinishReason
+		switch fr {
+		case "length":
+			stopReason = "max_tokens"
+		case "tool_calls":
+			stopReason = "tool_use"
+		case "":
+			stopReason = "end_turn"
+		default:
+			stopReason = fr
+		}
+	}
+
+	anthropic := map[string]interface{}{
+		"id":         openai.ID,
+		"type":       "message",
+		"role":       "assistant",
+		"model":      openai.Model,
+		"content":    content,
+		"stop_reason": stopReason,
+		"usage": map[string]interface{}{
+			"input_tokens":  openai.Usage.PromptTokens,
+			"output_tokens": openai.Usage.CompletionTokens,
+		},
+	}
+
+	return json.Marshal(anthropic)
 }

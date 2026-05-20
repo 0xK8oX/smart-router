@@ -1,0 +1,41 @@
+# Smart Router Plan Configuration
+
+plans:
+  free:
+    name: "Free Tier"
+    strategy: "latency"
+    rate_limit_rpm: 10
+    rate_limit_rpd: 100
+    providers:
+      - name: "orfree"
+        base_url: "http://localhost:23000/v1"
+        model: "auto"
+        format: "openai"
+        api_key: "sk-orfree"
+        timeout: 60
+        weight: 1
+        enabled: true
+
+  default:
+    name: "Default Tier"
+    strategy: "latency"
+    rate_limit_rpm: 60
+    rate_limit_rpd: 1000
+    providers:
+      - name: "orfree"
+        base_url: "http://localhost:23000/v1"
+        model: "auto"
+        format: "openai"
+        api_key: "sk-orfree"
+        timeout: 60
+        weight: 1
+        enabled: true
+      - name: "PPLX-Pro"
+        base_url: "http://localhost:8080/v1"
+        model: "PPLX-Pro"
+        format: "openai"
+        api_key: "sk-chat2api-pplx"
+        masked_key: "sk-c****pplx"
+        timeout: 60
+        weight: 1
+        enabled: true

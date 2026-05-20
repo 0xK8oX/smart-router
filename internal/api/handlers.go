@@ -698,6 +698,7 @@ func (s *Server) handleStatsAggregated(w http.ResponseWriter, r *http.Request) {
 }
 
 // SeedPlansFromFile loads plans from a YAML config file and saves them to the DB.
+// Only inserts missing plans — never overwrites existing plans so admin API edits are preserved.
 func SeedPlansFromFile(database *db.DB, path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -712,6 +713,11 @@ func SeedPlansFromFile(database *db.DB, path string) error {
 	}
 
 	for slug, plan := range cfg.Plans {
+		_, err := database.GetPlan(slug)
+		if err == nil {
+			// Plan already exists — skip to preserve admin API edits.
+			continue
+		}
 		if err := database.SavePlan(slug, plan); err != nil {
 			return err
 		}

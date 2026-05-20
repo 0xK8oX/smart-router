@@ -1072,11 +1072,11 @@ func TestTranslateResponse(t *testing.T) {
 		}
 	})
 
-	t.Run("anthropic to openai with invalid JSON returns error", func(t *testing.T) {
+	t.Run("openai to anthropic with invalid JSON returns error", func(t *testing.T) {
 		data := []byte(`{invalid json`)
 		_, err := TranslateResponse(data, "openai", "anthropic")
-		if err != nil {
-			t.Fatalf("unexpected error for unsupported direction: %v", err)
+		if err == nil {
+			t.Fatal("expected error for invalid JSON")
 		}
 	})
 }
