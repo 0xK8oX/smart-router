@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -58,5 +60,64 @@ func TestLoadPlans(t *testing.T) {
 		if p.Timeout != exp.timeout {
 			t.Errorf("provider[%d].Timeout = %d, want %d", i, p.Timeout, exp.timeout)
 		}
+	}
+}
+
+func TestLoadFromFile_NotExist(t *testing.T) {
+	_, err := LoadFromFile("/nonexistent/path/plans.yaml")
+	if err == nil {
+		t.Fatal("expected error for nonexistent file, got nil")
+	}
+}
+
+func TestLoadFromFile_InvalidYAML(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "invalid.yaml")
+	if err := os.WriteFile(path, []byte("not: valid: yaml: ["), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	_, err := LoadFromFile(path)
+	if err == nil {
+		t.Fatal("expected error for invalid YAML, got nil")
+	}
+}
+
+func TestLoadFromFile_EmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty.yaml")
+	if err := os.WriteFile(path, []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	cfg, err := LoadFromFile(path)
+	if err != nil {
+		t.Fatalf("LoadFromFile failed for empty file: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config for empty file")
+	}
+	if len(cfg.Plans) != 0 {
+		t.Fatalf("expected 0 plans for empty file, got %d", len(cfg.Plans))
+	}
+}
+
+func TestLoadFromFile_EmptyPlans(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "empty_plans.yaml")
+	content := `plans: {}`
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	cfg, err := LoadFromFile(path)
+	if err != nil {
+		t.Fatalf("LoadFromFile failed: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if len(cfg.Plans) != 0 {
+		t.Fatalf("expected 0 plans, got %d", len(cfg.Plans))
 	}
 }

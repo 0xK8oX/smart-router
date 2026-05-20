@@ -46,6 +46,17 @@ type APIKey struct {
 	Disabled            bool     `json:"disabled"`
 	CreatedAt           int64    `json:"created_at"`
 	LastUsedAt          *int64   `json:"last_used_at,omitempty"`
+	WebhookURL          string   `json:"webhook_url,omitempty"`
+	GroupID             *int64   `json:"group_id,omitempty"`
+}
+
+type KeyGroup struct {
+	ID                  int64   `json:"id"`
+	Name                string  `json:"name"`
+	MonthlyTokenLimit   int     `json:"monthly_token_limit"`
+	MonthlyRequestLimit int     `json:"monthly_request_limit"`
+	MonthlyBudgetLimit  float64 `json:"monthly_budget_limit"`
+	WebhookURL          string  `json:"webhook_url,omitempty"`
 }
 
 type StatRecord struct {

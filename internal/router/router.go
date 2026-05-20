@@ -31,7 +31,7 @@ type Router struct {
 	lastUsed       map[string]time.Time
 	planCache      map[string]cachedPlan
 	cacheTTL       time.Duration
-	mu             sync.Mutex
+	mu             sync.RWMutex
 }
 
 func New(tracker *health.HealthTracker, database *db.DB) *Router {
@@ -48,9 +48,9 @@ func New(tracker *health.HealthTracker, database *db.DB) *Router {
 }
 
 func (r *Router) getPlanCached(planSlug string) (*types.PlanConfig, error) {
-	r.mu.Lock()
+	r.mu.RLock()
 	entry, ok := r.planCache[planSlug]
-	r.mu.Unlock()
+	r.mu.RUnlock()
 	if ok && time.Since(entry.loadedAt) < r.cacheTTL {
 		return entry.plan, nil
 	}

@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -17,10 +19,22 @@ type Client struct {
 	httpClient *http.Client
 }
 
-// NewClient creates a new provider HTTP client.
+// NewClient creates a new provider HTTP client with connection timeouts.
 func NewClient() *Client {
 	return &Client{
-		httpClient: &http.Client{},
+		httpClient: &http.Client{
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 60 * time.Second,
+				IdleConnTimeout:       90 * time.Second,
+				MaxIdleConns:          100,
+				MaxIdleConnsPerHost:   10,
+			},
+		},
 	}
 }
 
@@ -85,12 +99,27 @@ func (c *Client) doRequest(provider types.ProviderConfig, body map[string]interf
 	return resp, nil
 }
 
+type cancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelBody) Close() error {
+	c.cancel()
+	return c.ReadCloser.Close()
+}
+
 // Call makes a non-streaming request to the provider.
 // headers is forwarded as-is when clientFormat == provider.Format (passthrough mode).
 func (c *Client) Call(provider types.ProviderConfig, body map[string]interface{}, headers http.Header) (*http.Response, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(provider.Timeout)*time.Second)
-	_ = cancel // don't cancel early — caller needs to read response body
-	return c.doRequest(provider, body, ctx, headers)
+	resp, err := c.doRequest(provider, body, ctx, headers)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
 }
 
 // CallStream makes a streaming request (sets stream=true in body).

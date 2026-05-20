@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"smart-router/internal/db"
@@ -998,6 +999,416 @@ func TestRouteLRU(t *testing.T) {
 	}
 	if provider3.Name != provider1.Name {
 		t.Errorf("third request should return to %s, got %s", provider1.Name, provider3.Name)
+	}
+}
+
+func TestInvalidatePlanCache(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"cache-test","object":"chat.completion","choices":[]}`))
+	}))
+	defer server.Close()
+
+	sqlitePath := "/tmp/test_router_invalidate.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-invalidate-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health tracker: %v", err)
+	}
+	defer ht.Close()
+
+	plan := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{
+				Name:    "openai",
+				BaseURL: server.URL,
+				Model:   "gpt-4",
+				Format:  "openai",
+				Timeout: 5,
+				APIKey:  "sk-test",
+			},
+		},
+	}
+	if err := database.SavePlan("pro", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+
+	body := map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	}
+
+	// First route should load and cache the plan
+	resp1, provider1, err := router.Route("pro", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error on first route: %v", err)
+	}
+	resp1.Body.Close()
+	if provider1.Name != "openai" {
+		t.Errorf("expected provider openai, got %s", provider1.Name)
+	}
+
+	// Update plan in DB directly (bypass cache)
+	updatedPlan := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{
+				Name:    "anthropic",
+				BaseURL: server.URL,
+				Model:   "claude-3",
+				Format:  "anthropic",
+				Timeout: 5,
+				APIKey:  "sk-ant",
+			},
+		},
+	}
+	if err := database.SavePlan("pro", updatedPlan); err != nil {
+		t.Fatalf("save updated plan: %v", err)
+	}
+
+	// Without invalidation, router should still use cached plan
+	resp2, provider2, err := router.Route("pro", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error on second route: %v", err)
+	}
+	resp2.Body.Close()
+	if provider2.Name != "openai" {
+		t.Errorf("expected cached provider openai, got %s", provider2.Name)
+	}
+
+	// Invalidate cache for this plan
+	router.InvalidatePlanCache("pro")
+
+	// Next route should reload from DB and see the updated plan
+	resp3, provider3, err := router.Route("pro", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error after invalidate: %v", err)
+	}
+	resp3.Body.Close()
+	if provider3.Name != "anthropic" {
+		t.Errorf("expected reloaded provider anthropic, got %s", provider3.Name)
+	}
+}
+
+func TestInvalidateAllPlanCache(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"cache-all-test","object":"chat.completion","choices":[]}`))
+	}))
+	defer server.Close()
+
+	sqlitePath := "/tmp/test_router_invalidate_all.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-invalidate-all-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health tracker: %v", err)
+	}
+	defer ht.Close()
+
+	planA := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "p1", BaseURL: server.URL, Model: "gpt-4", Format: "openai", Timeout: 5, APIKey: "sk-a"},
+		},
+	}
+	planB := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "p2", BaseURL: server.URL, Model: "gpt-4", Format: "openai", Timeout: 5, APIKey: "sk-b"},
+		},
+	}
+	if err := database.SavePlan("plan-a", planA); err != nil {
+		t.Fatalf("save plan-a: %v", err)
+	}
+	if err := database.SavePlan("plan-b", planB); err != nil {
+		t.Fatalf("save plan-b: %v", err)
+	}
+
+	router := New(ht, database)
+
+	body := map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	}
+
+	// Warm cache for both plans
+	resp1, _, err := router.Route("plan-a", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp1.Body.Close()
+	resp2, _, err := router.Route("plan-b", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp2.Body.Close()
+
+	// Update both plans in DB
+	updatedA := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "p1-new", BaseURL: server.URL, Model: "gpt-4", Format: "openai", Timeout: 5, APIKey: "sk-a"},
+		},
+	}
+	updatedB := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "p2-new", BaseURL: server.URL, Model: "gpt-4", Format: "openai", Timeout: 5, APIKey: "sk-b"},
+		},
+	}
+	if err := database.SavePlan("plan-a", updatedA); err != nil {
+		t.Fatalf("save updated plan-a: %v", err)
+	}
+	if err := database.SavePlan("plan-b", updatedB); err != nil {
+		t.Fatalf("save updated plan-b: %v", err)
+	}
+
+	// Invalidate all caches
+	router.InvalidateAllPlanCache()
+
+	// Both should now reload from DB
+	resp3, provider3, err := router.Route("plan-a", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error after invalidate all: %v", err)
+	}
+	resp3.Body.Close()
+	if provider3.Name != "p1-new" {
+		t.Errorf("expected provider p1-new, got %s", provider3.Name)
+	}
+
+	resp4, provider4, err := router.Route("plan-b", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error after invalidate all: %v", err)
+	}
+	resp4.Body.Close()
+	if provider4.Name != "p2-new" {
+		t.Errorf("expected provider p2-new, got %s", provider4.Name)
+	}
+}
+
+func TestRouteNetworkError(t *testing.T) {
+	// Server that closes connection immediately to simulate network error
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("hijacker not supported")
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		conn.Close()
+	}))
+	defer server.Close()
+
+	sqlitePath := "/tmp/test_router_network.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-network-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health tracker: %v", err)
+	}
+	defer ht.Close()
+
+	plan := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{
+				Name:    "network-fail",
+				BaseURL: server.URL,
+				Model:   "gpt-4",
+				Format:  "openai",
+				Timeout: 1,
+				APIKey:  "sk-test",
+			},
+		},
+	}
+	if err := database.SavePlan("pro", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+
+	body := map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	}
+
+	resp, _, err := router.Route("pro", body, false, "openai", nil, "")
+	if err == nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		t.Fatal("expected error for network failure, got nil")
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+}
+
+func TestRouteTranslationError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"test"}`))
+	}))
+	defer server.Close()
+
+	sqlitePath := "/tmp/test_router_translation.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-translation-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health tracker: %v", err)
+	}
+	defer ht.Close()
+
+	plan := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{
+				Name:    "bad-format",
+				BaseURL: server.URL,
+				Model:   "gpt-4",
+				Format:  "unknown-format",
+				Timeout: 5,
+				APIKey:  "sk-test",
+			},
+		},
+	}
+	if err := database.SavePlan("pro", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+
+	body := map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	}
+
+	resp, _, err := router.Route("pro", body, false, "openai", nil, "")
+	if err == nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		t.Fatal("expected error when translation fails and all providers exhausted, got nil")
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+}
+
+func TestRouteAllProvidersExhausted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":"unavailable"}`))
+	}))
+	defer server.Close()
+
+	sqlitePath := "/tmp/test_router_exhausted.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-exhausted-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health tracker: %v", err)
+	}
+	defer ht.Close()
+
+	plan := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{
+				Name:    "fail1",
+				BaseURL: server.URL,
+				Model:   "gpt-4",
+				Format:  "openai",
+				Timeout: 5,
+				APIKey:  "sk-test",
+			},
+			{
+				Name:    "fail2",
+				BaseURL: server.URL,
+				Model:   "gpt-4",
+				Format:  "openai",
+				Timeout: 5,
+				APIKey:  "sk-test",
+			},
+			{
+				Name:    "fail3",
+				BaseURL: server.URL,
+				Model:   "gpt-4",
+				Format:  "openai",
+				Timeout: 5,
+				APIKey:  "sk-test",
+			},
+		},
+	}
+	if err := database.SavePlan("pro", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+
+	body := map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	}
+
+	resp, _, err := router.Route("pro", body, false, "openai", nil, "")
+	if err == nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		t.Fatal("expected error when all providers fail, got nil")
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if !strings.Contains(err.Error(), "all providers failed") {
+		t.Errorf("expected 'all providers failed' in error, got %v", err)
 	}
 }
 

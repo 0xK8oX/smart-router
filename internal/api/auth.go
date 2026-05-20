@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"smart-router/internal/alerts"
 	"smart-router/internal/auth"
 	"smart-router/internal/db"
 	"smart-router/internal/types"
@@ -17,15 +18,28 @@ import (
 // contextKey is a private type for context keys to avoid collisions.
 type contextKey int
 
-const clientKeyContextKey contextKey = iota
+const (
+	clientKeyContextKey contextKey = iota
+	apiKeyContextKey
+)
 
 // Auth handles API key validation, rate limiting, and quota enforcement.
 type Auth struct {
-	db          *db.DB
-	rl          *auth.RateLimiter
-	keyCache    map[string]cachedKey
-	keyCacheMu  sync.RWMutex
-	cacheTTL    time.Duration
+	db            *db.DB
+	rl            *auth.RateLimiter
+	keyCache      map[string]cachedKey
+	keyCacheMu    sync.RWMutex
+	keyCacheTTL   time.Duration
+	usageCache    map[string]usageCacheEntry
+	usageCacheMu  sync.RWMutex
+	usageCacheTTL time.Duration
+	groupCache    map[int64]groupCacheEntry
+	groupCacheMu  sync.RWMutex
+	groupCacheTTL time.Duration
+	lastUsedBatch map[string]struct{}
+	lastUsedMu    sync.Mutex
+	alertedKeys   map[string]bool // key="key:YYYY-MM" tracks 80% quota alerts sent this month
+	alertedMu     sync.Mutex
 }
 
 type cachedKey struct {
@@ -33,15 +47,32 @@ type cachedKey struct {
 	loadedAt time.Time
 }
 
+type usageCacheEntry struct {
+	usage    *db.MonthlyUsage
+	loadedAt time.Time
+}
+
+type groupCacheEntry struct {
+	group    *types.KeyGroup
+	loadedAt time.Time
+}
+
 // NewAuth creates a new Auth handler with an in-memory key cache.
 func NewAuth(database *db.DB, rateLimiter *auth.RateLimiter) *Auth {
 	a := &Auth{
-		db:       database,
-		rl:       rateLimiter,
-		keyCache: make(map[string]cachedKey),
-		cacheTTL: 30 * time.Second,
+		db:            database,
+		rl:            rateLimiter,
+		keyCache:      make(map[string]cachedKey),
+		keyCacheTTL:   30 * time.Second,
+		usageCache:    make(map[string]usageCacheEntry),
+		usageCacheTTL: 10 * time.Second,
+		groupCache:    make(map[int64]groupCacheEntry),
+		groupCacheTTL: 60 * time.Second,
+		lastUsedBatch: make(map[string]struct{}),
+		alertedKeys:   make(map[string]bool),
 	}
 	go a.cacheEvictionWorker()
+	go a.lastUsedFlushWorker()
 	return a
 }
 
@@ -82,6 +113,7 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 		}
 
 		if apiKey.ExpiresAt != nil && *apiKey.ExpiresAt < time.Now().Unix() {
+			alerts.SendWebhookExpiredAlert(apiKey.WebhookURL, apiKey.Name)
 			writeError(w, http.StatusUnauthorized, "api key expired")
 			return
 		}
@@ -108,7 +140,7 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 		if len(apiKey.Plans) > 0 {
 			allowed := false
 			for _, p := range apiKey.Plans {
-				if p == planSlug {
+				if p == planSlug || p == "*" {
 					allowed = true
 					break
 				}
@@ -128,7 +160,7 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 		// Monthly quota checks
 		now := time.Now()
 		if apiKey.MonthlyTokenLimit > 0 || apiKey.MonthlyRequestLimit > 0 {
-			usage, err := a.db.GetKeyMonthlyUsage(token, now.Year(), int(now.Month()))
+			usage, err := a.getUsageCached(token, now.Year(), int(now.Month()))
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, "failed to check quota")
 				return
@@ -141,17 +173,41 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 				writeError(w, http.StatusTooManyRequests, "monthly request quota exceeded")
 				return
 			}
+
+			// Check 80% quota threshold and trigger webhook
+			a.checkAndSendQuotaAlert(apiKey, usage)
 		}
 
-		// Update last_used_at async
-		go a.db.UpdateKeyLastUsed(token)
+		// Group quota checks
+		if apiKey.GroupID != nil {
+			group, err := a.getGroupCached(*apiKey.GroupID)
+			if err == nil && (group.MonthlyTokenLimit > 0 || group.MonthlyRequestLimit > 0) {
+				groupUsage, err := a.getGroupUsageCached(*apiKey.GroupID, now.Year(), int(now.Month()))
+				if err != nil {
+					writeError(w, http.StatusInternalServerError, "failed to check group quota")
+					return
+				}
+				if group.MonthlyTokenLimit > 0 && groupUsage.RequestTokens+groupUsage.ResponseTokens >= int64(group.MonthlyTokenLimit) {
+					writeError(w, http.StatusTooManyRequests, "group monthly token quota exceeded")
+					return
+				}
+				if group.MonthlyRequestLimit > 0 && groupUsage.RequestCount >= int64(group.MonthlyRequestLimit) {
+					writeError(w, http.StatusTooManyRequests, "group monthly request quota exceeded")
+					return
+				}
+			}
+		}
+
+		// Batch last_used_at update
+		a.markLastUsed(token)
 
 		ctx := context.WithValue(r.Context(), clientKeyContextKey, token)
+		ctx = context.WithValue(ctx, apiKeyContextKey, apiKey)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// ClientKeyFromContext extracts the API key from the request context.
+// ClientKeyFromContext extracts the API key string from the request context.
 func ClientKeyFromContext(ctx context.Context) string {
 	if v, ok := ctx.Value(clientKeyContextKey).(string); ok {
 		return v
@@ -159,11 +215,19 @@ func ClientKeyFromContext(ctx context.Context) string {
 	return ""
 }
 
+// APIKeyFromContext extracts the validated APIKey from the request context.
+func APIKeyFromContext(ctx context.Context) *types.APIKey {
+	if v, ok := ctx.Value(apiKeyContextKey).(*types.APIKey); ok {
+		return v
+	}
+	return nil
+}
+
 func (a *Auth) getKeyCached(key string) (*types.APIKey, error) {
 	a.keyCacheMu.RLock()
 	entry, ok := a.keyCache[key]
 	a.keyCacheMu.RUnlock()
-	if ok && time.Since(entry.loadedAt) < a.cacheTTL {
+	if ok && time.Since(entry.loadedAt) < a.keyCacheTTL {
 		return entry.key, nil
 	}
 
@@ -178,17 +242,155 @@ func (a *Auth) getKeyCached(key string) (*types.APIKey, error) {
 	return k, nil
 }
 
-func (a *Auth) cacheEvictionWorker() {
-	ticker := time.NewTicker(a.cacheTTL)
+func (a *Auth) getUsageCached(key string, year, month int) (*db.MonthlyUsage, error) {
+	cacheKey := fmt.Sprintf("%s:%d-%02d", key, year, month)
+	a.usageCacheMu.RLock()
+	entry, ok := a.usageCache[cacheKey]
+	a.usageCacheMu.RUnlock()
+	if ok && time.Since(entry.loadedAt) < a.usageCacheTTL {
+		return entry.usage, nil
+	}
+
+	usage, err := a.db.GetKeyMonthlyUsage(key, year, month)
+	if err != nil {
+		return nil, err
+	}
+
+	a.usageCacheMu.Lock()
+	a.usageCache[cacheKey] = usageCacheEntry{usage: usage, loadedAt: time.Now()}
+	a.usageCacheMu.Unlock()
+	return usage, nil
+}
+
+func (a *Auth) getGroupCached(id int64) (*types.KeyGroup, error) {
+	a.groupCacheMu.RLock()
+	entry, ok := a.groupCache[id]
+	a.groupCacheMu.RUnlock()
+	if ok && time.Since(entry.loadedAt) < a.groupCacheTTL {
+		return entry.group, nil
+	}
+
+	group, err := a.db.GetKeyGroup(id)
+	if err != nil {
+		return nil, err
+	}
+
+	a.groupCacheMu.Lock()
+	a.groupCache[id] = groupCacheEntry{group: group, loadedAt: time.Now()}
+	a.groupCacheMu.Unlock()
+	return group, nil
+}
+
+func (a *Auth) getGroupUsageCached(groupID int64, year, month int) (*db.MonthlyUsage, error) {
+	cacheKey := fmt.Sprintf("group:%d:%d-%02d", groupID, year, month)
+	a.usageCacheMu.RLock()
+	entry, ok := a.usageCache[cacheKey]
+	a.usageCacheMu.RUnlock()
+	if ok && time.Since(entry.loadedAt) < a.usageCacheTTL {
+		return entry.usage, nil
+	}
+
+	usage, err := a.db.GetGroupMonthlyUsage(groupID, year, month)
+	if err != nil {
+		return nil, err
+	}
+
+	a.usageCacheMu.Lock()
+	a.usageCache[cacheKey] = usageCacheEntry{usage: usage, loadedAt: time.Now()}
+	a.usageCacheMu.Unlock()
+	return usage, nil
+}
+
+func (a *Auth) markLastUsed(key string) {
+	a.lastUsedMu.Lock()
+	a.lastUsedBatch[key] = struct{}{}
+	a.lastUsedMu.Unlock()
+}
+
+func (a *Auth) lastUsedFlushWorker() {
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
+		a.lastUsedMu.Lock()
+		batch := a.lastUsedBatch
+		a.lastUsedBatch = make(map[string]struct{})
+		a.lastUsedMu.Unlock()
+
+		if len(batch) == 0 {
+			continue
+		}
+		now := time.Now().Unix()
+		for key := range batch {
+			_ = a.db.UpdateKeyLastUsedWithTime(key, now)
+		}
+	}
+}
+
+func (a *Auth) cacheEvictionWorker() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+
 		a.keyCacheMu.Lock()
 		for k, v := range a.keyCache {
-			if time.Since(v.loadedAt) > a.cacheTTL {
+			if now.Sub(v.loadedAt) > a.keyCacheTTL {
 				delete(a.keyCache, k)
 			}
 		}
 		a.keyCacheMu.Unlock()
+
+		a.usageCacheMu.Lock()
+		for k, v := range a.usageCache {
+			if now.Sub(v.loadedAt) > a.usageCacheTTL {
+				delete(a.usageCache, k)
+			}
+		}
+		a.usageCacheMu.Unlock()
+
+		a.groupCacheMu.Lock()
+		for k, v := range a.groupCache {
+			if now.Sub(v.loadedAt) > a.groupCacheTTL {
+				delete(a.groupCache, k)
+			}
+		}
+		a.groupCacheMu.Unlock()
+	}
+}
+
+func (a *Auth) checkAndSendQuotaAlert(apiKey *types.APIKey, usage *db.MonthlyUsage) {
+	if apiKey.WebhookURL == "" {
+		return
+	}
+	now := time.Now()
+	alertKey := fmt.Sprintf("%s:%d-%02d", apiKey.Key, now.Year(), now.Month())
+
+	a.alertedMu.Lock()
+	if a.alertedKeys[alertKey] {
+		a.alertedMu.Unlock()
+		return
+	}
+	a.alertedMu.Unlock()
+
+	var percent float64
+	if apiKey.MonthlyTokenLimit > 0 {
+		totalTokens := usage.RequestTokens + usage.ResponseTokens
+		pct := float64(totalTokens) / float64(apiKey.MonthlyTokenLimit) * 100
+		if pct > percent {
+			percent = pct
+		}
+	}
+	if apiKey.MonthlyRequestLimit > 0 {
+		pct := float64(usage.RequestCount) / float64(apiKey.MonthlyRequestLimit) * 100
+		if pct > percent {
+			percent = pct
+		}
+	}
+	if percent >= 80 {
+		a.alertedMu.Lock()
+		a.alertedKeys[alertKey] = true
+		a.alertedMu.Unlock()
+		alerts.SendWebhookQuotaAlert(apiKey.WebhookURL, apiKey.Name, percent, usage.RequestTokens, usage.ResponseTokens, usage.RequestCount)
 	}
 }
 

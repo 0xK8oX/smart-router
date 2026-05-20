@@ -128,6 +128,172 @@ func TestCallProviderTimeout(t *testing.T) {
 	}
 }
 
+func TestDoRequest_NativeAnthropicHeaders(t *testing.T) {
+	var gotAPIKey, gotVersion string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAPIKey = r.Header.Get("x-api-key")
+		gotVersion = r.Header.Get("anthropic-version")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"test","type":"message"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient()
+	provider := types.ProviderConfig{
+		Name:    "anthropic-native",
+		BaseURL: server.URL + "/api.anthropic.com",
+		Model:   "claude-3-opus",
+		Format:  "anthropic",
+		Timeout: 5,
+		APIKey:  "sk-ant-test",
+	}
+	body := map[string]interface{}{"model": "claude-3-opus", "messages": []map[string]string{{"role": "user", "content": "hello"}}}
+
+	resp, err := client.Call(provider, body, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotAPIKey != "sk-ant-test" {
+		t.Errorf("expected x-api-key header sk-ant-test, got %s", gotAPIKey)
+	}
+	if gotVersion != "2023-06-01" {
+		t.Errorf("expected anthropic-version header 2023-06-01, got %s", gotVersion)
+	}
+}
+
+func TestDoRequest_KimiCodingHeaders(t *testing.T) {
+	var gotUA string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"test"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient()
+	provider := types.ProviderConfig{
+		Name:    "kimi-coding",
+		BaseURL: server.URL + "/api.kimi.com/coding",
+		Model:   "kimi-coder",
+		Format:  "openai",
+		Timeout: 5,
+		APIKey:  "sk-kimi-test",
+	}
+	body := map[string]interface{}{"model": "kimi-coder"}
+
+	resp, err := client.Call(provider, body, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotUA != "claude-code/0.1.0" {
+		t.Errorf("expected User-Agent claude-code/0.1.0, got %s", gotUA)
+	}
+}
+
+func TestDoRequest_HeaderForwarding(t *testing.T) {
+	var gotCustom string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCustom = r.Header.Get("X-Custom-Header")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"test"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient()
+	provider := types.ProviderConfig{
+		Name:    "openai",
+		BaseURL: server.URL,
+		Model:   "gpt-4",
+		Format:  "openai",
+		Timeout: 5,
+		APIKey:  "sk-test",
+	}
+	body := map[string]interface{}{"model": "gpt-4"}
+	headers := http.Header{}
+	headers.Set("X-Custom-Header", "custom-value")
+
+	resp, err := client.Call(provider, body, headers)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotCustom != "custom-value" {
+		t.Errorf("expected X-Custom-Header custom-value, got %s", gotCustom)
+	}
+}
+
+func TestDoRequest_DefaultAuthHeader(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"test"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient()
+	provider := types.ProviderConfig{
+		Name:    "generic",
+		BaseURL: server.URL,
+		Model:   "model-x",
+		Format:  "openai",
+		Timeout: 5,
+		APIKey:  "sk-generic-test",
+	}
+	body := map[string]interface{}{"model": "model-x"}
+
+	resp, err := client.Call(provider, body, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotAuth != "Bearer sk-generic-test" {
+		t.Errorf("expected Authorization Bearer sk-generic-test, got %s", gotAuth)
+	}
+}
+
+func TestDoRequest_AnthropicFormatNonNative(t *testing.T) {
+	var gotVersion string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotVersion = r.Header.Get("anthropic-version")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"test"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient()
+	provider := types.ProviderConfig{
+		Name:    "anthropic-proxy",
+		BaseURL: server.URL,
+		Model:   "claude-3-opus",
+		Format:  "anthropic",
+		Timeout: 5,
+		APIKey:  "sk-proxy-test",
+	}
+	body := map[string]interface{}{"model": "claude-3-opus"}
+
+	resp, err := client.Call(provider, body, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if gotVersion != "2023-06-01" {
+		t.Errorf("expected anthropic-version header 2023-06-01, got %s", gotVersion)
+	}
+}
+
 func TestCallStream(t *testing.T) {
 	var receivedBody map[string]interface{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

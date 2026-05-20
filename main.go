@@ -13,6 +13,7 @@ import (
 	"smart-router/internal/db"
 	"smart-router/internal/health"
 	"smart-router/internal/router"
+	"smart-router/internal/types"
 )
 
 func main() {
@@ -62,14 +63,35 @@ func main() {
 	authHandler := api.NewAuth(database, rateLimiter)
 	server := api.NewServer(r, ht, database, authHandler, adminKey)
 
+	// Bootstrap a default API key if none exist
+	if count, err := database.CountAPIKeys(); err != nil {
+		log.Printf("warning: failed to count api keys: %v", err)
+	} else if count == 0 {
+		defaultKey := types.APIKey{
+			Key:       auth.GenerateAPIKey(),
+			Name:      "default",
+			Plans:     []string{},
+			Models:    []string{},
+			CreatedAt: time.Now().Unix(),
+		}
+		if err := database.CreateAPIKey(defaultKey); err != nil {
+			log.Printf("warning: failed to create default api key: %v", err)
+		} else {
+			log.Printf("=================================================")
+			log.Printf("DEFAULT API KEY CREATED: %s", defaultKey.Key)
+			log.Printf("Use this key with Authorization: Bearer %s", defaultKey.Key)
+			log.Printf("=================================================")
+		}
+	}
+
 	// Start Telegram bot for commands
 	alerts.StartBot(database, ht)
 
 	muxRouter := mux.NewRouter()
-	server.RegisterRoutes(muxRouter)
-
-	// Auth middleware first, then logging
+	// Auth middleware MUST be applied BEFORE route registration
+	// so that gorilla/mux captures it on every route.
 	muxRouter.Use(authHandler.Middleware)
+	server.RegisterRoutes(muxRouter)
 	handler := loggingMiddleware(muxRouter)
 
 	addr := host + ":" + port

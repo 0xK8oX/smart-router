@@ -117,7 +117,8 @@ func convertToolChoice(body map[string]interface{}) {
 		}
 	case map[string]interface{}:
 		if tc["type"] == "function" {
-			if name, ok := tc["function"].(map[string]interface{})["name"].(string); ok {
+			fn, _ := tc["function"].(map[string]interface{})
+			if name, ok := fn["name"].(string); ok {
 				body["tool_choice"] = map[string]interface{}{
 					"type": "tool",
 					"name": name,
@@ -380,13 +381,13 @@ func translateAnthropicToOpenAI(data []byte) ([]byte, error) {
 		anthropic.Usage.OutputTokens = anthropic.Usage.CompletionTokens
 	}
 
-	var content string
+	var content strings.Builder
 	var toolCalls []map[string]interface{}
 	var imageURLs []map[string]interface{}
 	for i, c := range anthropic.Content {
 		switch c.Type {
 		case "text":
-			content += c.Text
+			content.WriteString(c.Text)
 		case "tool_use":
 			args := "{}"
 			if len(c.Input) > 0 {
@@ -423,21 +424,22 @@ func translateAnthropicToOpenAI(data []byte) ([]byte, error) {
 		finishReason = "stop"
 	}
 
+	contentStr := content.String()
 	msg := map[string]interface{}{
 		"role":    "assistant",
-		"content": content,
+		"content": contentStr,
 	}
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
-		if content == "" {
+		if contentStr == "" {
 			msg["content"] = nil
 		}
 	}
 	if len(imageURLs) > 0 {
-		if content != "" {
+		if contentStr != "" {
 			imageURLs = append([]map[string]interface{}{{
 				"type": "text",
-				"text": content,
+				"text": contentStr,
 			}}, imageURLs...)
 		}
 		msg["content"] = imageURLs

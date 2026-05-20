@@ -18,12 +18,13 @@ import (
 
 // Bot polls Telegram for commands and responds with router stats/health.
 type Bot struct {
-	token   string
-	db      *db.DB
-	health  *health.HealthTracker
-	offset  int64
-	client  *http.Client
-	stop    chan struct{}
+	token     string
+	db        *db.DB
+	health    *health.HealthTracker
+	offset    int64
+	client    *http.Client
+	stop      chan struct{}
+	sem       chan struct{}
 }
 
 // StartBot launches a background goroutine that polls Telegram for commands.
@@ -40,6 +41,7 @@ func StartBot(database *db.DB, ht *health.HealthTracker) {
 		health: ht,
 		client: &http.Client{Timeout: 30 * time.Second},
 		stop:   make(chan struct{}),
+		sem:    make(chan struct{}, 5),
 	}
 
 	go b.pollLoop()
@@ -94,7 +96,15 @@ func (b *Bot) pollOnce() {
 			b.offset = u.UpdateID
 		}
 		if u.Message.Text != "" {
-			go b.handleCommand(u.Message.Chat.ID, u.Message.Text)
+			select {
+			case b.sem <- struct{}{}:
+				go func(chatID int64, text string) {
+					defer func() { <-b.sem }()
+					b.handleCommand(chatID, text)
+				}(u.Message.Chat.ID, u.Message.Text)
+			default:
+				log.Printf("[telegram] command dropped: too many concurrent commands")
+			}
 		}
 	}
 }
@@ -131,6 +141,12 @@ func (b *Bot) buildReply(text string) string {
 		return b.cmdTop()
 	case "/failures":
 		return b.cmdFailures()
+	case "/keys":
+		return b.cmdKeys()
+	case "/key":
+		return b.cmdKey(args)
+	case "/keyusage":
+		return b.cmdKeyUsage(args)
 	case "/help", "/start":
 		return b.cmdHelp()
 	default:
@@ -572,7 +588,150 @@ func (b *Bot) cmdHelp() string {
 /status — Overall system status
 /top — Top providers by usage
 /failures — Recent failed requests
+/keys — List all API keys
+/key <key_or_name> — Show key details and usage
+/keyusage <key_or_name> [5h|1d|1w|30d|1m] — Usage for specific key
 /help — Show this message`
+}
+
+func (b *Bot) cmdKeys() string {
+	keys, err := b.db.ListAPIKeys()
+	if err != nil {
+		return "Error listing API keys."
+	}
+	if len(keys) == 0 {
+		return "No API keys found."
+	}
+
+	var lines []string
+	lines = append(lines, fmt.Sprintf("*API Keys (%d)*", len(keys)))
+	for _, k := range keys {
+		status := "🟢"
+		if k.Disabled {
+			status = "🔴 disabled"
+		}
+		planCount := len(k.Plans)
+		if planCount == 0 {
+			planCount = -1 // signals all plans
+		}
+		planStr := fmt.Sprintf("%d plans", planCount)
+		if planCount == -1 {
+			planStr = "all plans"
+		}
+		lines = append(lines, fmt.Sprintf("  %s `%s` — %s (%s)", status, k.Name, maskAPIKey(k.Key), planStr))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (b *Bot) resolveKey(query string) (*types.APIKey, error) {
+	if k, err := b.db.GetAPIKey(query); err == nil {
+		return k, nil
+	}
+	if k, err := b.db.GetAPIKeyByName(query); err == nil {
+		return k, nil
+	}
+	return nil, fmt.Errorf("not found")
+}
+
+func (b *Bot) cmdKey(args []string) string {
+	if len(args) < 1 {
+		return "Usage: /key <key_or_name>"
+	}
+	query := args[0]
+
+	k, err := b.resolveKey(query)
+	if err != nil {
+		return fmt.Sprintf("Key *%s* not found.", query)
+	}
+
+	var lines []string
+	lines = append(lines, fmt.Sprintf("*Key: %s*", k.Name))
+	lines = append(lines, fmt.Sprintf("Key: `%s`", maskAPIKey(k.Key)))
+	if k.Disabled {
+		lines = append(lines, "Status: 🔴 disabled")
+	} else {
+		lines = append(lines, "Status: 🟢 active")
+	}
+	if len(k.Plans) > 0 {
+		lines = append(lines, fmt.Sprintf("Plans: %s", strings.Join(k.Plans, ", ")))
+	} else {
+		lines = append(lines, "Plans: all")
+	}
+	if len(k.Models) > 0 {
+		lines = append(lines, fmt.Sprintf("Models: %s", strings.Join(k.Models, ", ")))
+	}
+	if len(k.AllowedIPs) > 0 {
+		lines = append(lines, fmt.Sprintf("Allowed IPs: %s", strings.Join(k.AllowedIPs, ", ")))
+	}
+	if k.RateLimitRPM > 0 {
+		lines = append(lines, fmt.Sprintf("RPM: %d", k.RateLimitRPM))
+	}
+	if k.RateLimitRPD > 0 {
+		lines = append(lines, fmt.Sprintf("RPD: %d", k.RateLimitRPD))
+	}
+	if k.MonthlyTokenLimit > 0 {
+		lines = append(lines, fmt.Sprintf("Monthly token limit: %s", formatNumber(int64(k.MonthlyTokenLimit))))
+	}
+	if k.MonthlyRequestLimit > 0 {
+		lines = append(lines, fmt.Sprintf("Monthly request limit: %s", formatNumber(int64(k.MonthlyRequestLimit))))
+	}
+	if k.ExpiresAt != nil {
+		lines = append(lines, fmt.Sprintf("Expires: %s", time.Unix(*k.ExpiresAt, 0).Format("2006-01-02")))
+	}
+	lines = append(lines, fmt.Sprintf("Created: %s", time.Unix(k.CreatedAt, 0).Format("2006-01-02")))
+
+	usage, _ := b.db.GetKeyMonthlyUsage(k.Key, time.Now().Year(), int(time.Now().Month()))
+	if usage != nil {
+		lines = append(lines, "")
+		lines = append(lines, fmt.Sprintf("This month: %s req, %s tok", formatNumber(usage.RequestCount), formatNumber(usage.RequestTokens+usage.ResponseTokens)))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func (b *Bot) cmdKeyUsage(args []string) string {
+	if len(args) < 1 {
+		return "Usage: /keyusage <key_or_name> [5h|1d|1w|30d|1m]"
+	}
+	query := args[0]
+
+	k, err := b.resolveKey(query)
+	if err != nil {
+		return fmt.Sprintf("Key *%s* not found.", query)
+	}
+
+	duration, label := parseTimeWindow("30d")
+	if len(args) >= 2 {
+		duration, label = parseTimeWindow(args[1])
+	}
+
+	usage, err := b.db.GetKeyUsageSince(k.Key, time.Now().Add(-duration))
+	if err != nil {
+		return fmt.Sprintf("Error fetching usage for *%s*: %v", k.Name, err)
+	}
+
+	now := time.Now()
+	monthly, _ := b.db.GetKeyMonthlyUsage(k.Key, now.Year(), int(now.Month()))
+	cost, _ := b.db.GetKeyMonthlyCost(k.Key, now.Year(), int(now.Month()))
+
+	var lines []string
+	lines = append(lines, fmt.Sprintf("*%s* — %s", k.Name, label))
+	lines = append(lines, fmt.Sprintf("Requests: %s", formatNumber(usage.RequestCount)))
+	lines = append(lines, fmt.Sprintf("Tokens: %s (%s in / %s out)", formatNumber(usage.RequestTokens+usage.ResponseTokens), formatNumber(usage.RequestTokens), formatNumber(usage.ResponseTokens)))
+	if monthly != nil {
+		lines = append(lines, fmt.Sprintf("This month: %s req, %s tok", formatNumber(monthly.RequestCount), formatNumber(monthly.RequestTokens+monthly.ResponseTokens)))
+	}
+	if cost > 0 {
+		lines = append(lines, fmt.Sprintf("Est. cost: $%.4f", cost))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func maskAPIKey(key string) string {
+	if len(key) <= 12 {
+		return "****"
+	}
+	return key[:6] + "****" + key[len(key)-4:]
 }
 
 func formatHealth(name string, h types.ProviderHealth) string {

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -40,6 +42,10 @@ func NewServer(r *router.Router, h *health.HealthTracker, d *db.DB, a *Auth, adm
 }
 
 func (s *Server) RegisterRoutes(r *mux.Router) {
+	// CORS middleware must be applied BEFORE route registration
+	// so that routes capture it.
+	r.Use(corsMiddleware)
+
 	r.HandleFunc("/v1/chat/completions", s.handleChatCompletions).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/messages", s.handleMessages).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/models", s.handleListModels).Methods(http.MethodGet, http.MethodOptions)
@@ -64,13 +70,17 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/v1/pricing", s.handleListPricing).Methods(http.MethodGet, http.MethodOptions)
 	r.HandleFunc("/v1/pricing/{model}", s.handleSetPricing).Methods(http.MethodPut, http.MethodOptions)
 
-	// CORS preflight
+	// Key Group admin endpoints
+	r.HandleFunc("/v1/groups", s.handleListGroups).Methods(http.MethodGet, http.MethodOptions)
+	r.HandleFunc("/v1/groups", s.handleCreateGroup).Methods(http.MethodPost, http.MethodOptions)
+	r.HandleFunc("/v1/groups/{id}", s.handleGetGroup).Methods(http.MethodGet, http.MethodOptions)
+	r.HandleFunc("/v1/groups/{id}", s.handleUpdateGroup).Methods(http.MethodPut, http.MethodOptions)
+	r.HandleFunc("/v1/groups/{id}", s.handleDeleteGroup).Methods(http.MethodDelete, http.MethodOptions)
+
+	// CORS preflight — catch-all for any path
 	r.Methods(http.MethodOptions).HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-
-	// CORS middleware
-	r.Use(corsMiddleware)
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -117,27 +127,31 @@ func extractUsage(data []byte, format string) (reqTokens, respTokens int) {
 	return usage.Usage.PromptTokens, usage.Usage.CompletionTokens
 }
 
+var (
+	sseEventSep   = []byte("\n\n")
+	sseLineSep    = []byte("\n")
+	sseDataPrefix = []byte("data:")
+	sseDoneMarker = []byte("[DONE]")
+)
+
 // extractUsageFromStream scans captured SSE bytes for usage chunks.
 func extractUsageFromStream(data []byte, format string) (reqTokens, respTokens int) {
-	events := strings.Split(string(data), "\n\n")
+	events := bytes.Split(data, sseEventSep)
 	for _, event := range events {
-		lines := strings.Split(event, "\n")
-		var dataParts []string
+		lines := bytes.Split(event, sseLineSep)
+		var eventData []byte
 		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "data:") {
-				dataParts = append(dataParts, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			line = bytes.TrimSpace(line)
+			if bytes.HasPrefix(line, sseDataPrefix) {
+				part := bytes.TrimSpace(bytes.TrimPrefix(line, sseDataPrefix))
+				eventData = append(eventData, part...)
 			}
 		}
-		if len(dataParts) == 0 {
-			continue
-		}
-		eventData := strings.Join(dataParts, "")
-		if eventData == "" || eventData == "[DONE]" {
+		if len(eventData) == 0 || bytes.Equal(eventData, sseDoneMarker) {
 			continue
 		}
 		var eventJSON map[string]interface{}
-		if err := json.Unmarshal([]byte(eventData), &eventJSON); err != nil {
+		if err := json.Unmarshal(eventData, &eventJSON); err != nil {
 			continue
 		}
 		if usage, ok := eventJSON["usage"].(map[string]interface{}); ok {
@@ -194,6 +208,13 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
+var streamBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 4096)
+		return &b
+	},
+}
+
 func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string, clientKey string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -201,7 +222,9 @@ func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSl
 	}
 	const maxCapture = 32 * 1024
 	var captured []byte
-	buf := make([]byte, 4096)
+	bufPtr := streamBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer streamBufPool.Put(bufPtr)
 	for {
 		n, err := bodyReader.Read(buf)
 		if n > 0 {
@@ -240,6 +263,8 @@ func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSl
 	}
 }
 
+const maxRequestBodySize = 10 * 1024 * 1024 // 10MB
+
 func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, clientFormat string) {
 	start := time.Now()
 	if r.Method == http.MethodOptions {
@@ -247,6 +272,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 	body := make(map[string]interface{})
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
@@ -281,21 +307,18 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 	clientKey := ClientKeyFromContext(r.Context())
 
 	// Model restriction check for authenticated requests
-	if clientKey != "" {
-		apiKey, _ := s.auth.getKeyCached(clientKey)
-		if apiKey != nil && len(apiKey.Models) > 0 {
-			requestedModel, _ := body["model"].(string)
-			allowed := false
-			for _, m := range apiKey.Models {
-				if m == requestedModel || m == "*" {
-					allowed = true
-					break
-				}
+	if apiKey := APIKeyFromContext(r.Context()); apiKey != nil && len(apiKey.Models) > 0 {
+		requestedModel, _ := body["model"].(string)
+		allowed := false
+		for _, m := range apiKey.Models {
+			if m == requestedModel || m == "*" {
+				allowed = true
+				break
 			}
-			if !allowed {
-				writeError(w, http.StatusForbidden, "model not allowed for this key")
-				return
-			}
+		}
+		if !allowed {
+			writeError(w, http.StatusForbidden, "model not allowed for this key")
+			return
 		}
 	}
 
@@ -380,8 +403,8 @@ func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"data":   defaultModels,
-		"object": "list",
+		"data":     defaultModels,
+		"object":   "list",
 		"has_more": false,
 		"first_id": defaultModels[0]["id"],
 		"last_id":  defaultModels[len(defaultModels)-1]["id"],
@@ -674,7 +697,6 @@ func (s *Server) handleStatsAggregated(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, aggregated)
 }
 
-
 // SeedPlansFromFile loads plans from a YAML config file and saves them to the DB.
 func SeedPlansFromFile(database *db.DB, path string) error {
 	data, err := os.ReadFile(path)
@@ -695,26 +717,6 @@ func SeedPlansFromFile(database *db.DB, path string) error {
 		}
 	}
 	return nil
-}
-
-// ensureDefaultPlan creates a default plan if none exists.
-func ensureDefaultPlan(database *db.DB) error {
-	_, err := database.GetPlan("default")
-	if err == nil {
-		return nil
-	}
-	// Create a minimal default plan
-	defaultPlan := types.PlanConfig{
-		Providers: []types.ProviderConfig{},
-	}
-	return database.SavePlan("default", defaultPlan)
-}
-
-func maskAPIKey(key string) string {
-	if len(key) <= 8 {
-		return "****"
-	}
-	return key[:4] + "****" + key[len(key)-4:]
 }
 
 func requireAdmin(w http.ResponseWriter, r *http.Request, adminKey string) bool {
@@ -763,7 +765,7 @@ func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	// Mask key values in listing
 	for i := range keys {
-		keys[i].Key = maskAPIKey(keys[i].Key)
+		keys[i].Key = types.MaskAPIKey(keys[i].Key)
 	}
 	writeJSON(w, http.StatusOK, keys)
 }
@@ -904,6 +906,117 @@ func (s *Server) handleSetPricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.db.SetModelPricing(model, req.InputPrice, req.OutputPrice); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	groups, err := s.db.ListKeyGroups()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, groups)
+}
+
+func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	var req types.KeyGroup
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	id, err := s.db.CreateKeyGroup(req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"id": id})
+}
+
+func (s *Server) handleGetGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	idStr := mux.Vars(r)["id"]
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid group id")
+		return
+	}
+	g, err := s.db.GetKeyGroup(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	now := time.Now()
+	usage, _ := s.db.GetGroupMonthlyUsage(id, now.Year(), int(now.Month()))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"group": g,
+		"usage": usage,
+	})
+}
+
+func (s *Server) handleUpdateGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	idStr := mux.Vars(r)["id"]
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid group id")
+		return
+	}
+	var updates types.KeyGroup
+	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := s.db.UpdateKeyGroup(id, updates); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !requireAdmin(w, r, s.adminKey) {
+		return
+	}
+	idStr := mux.Vars(r)["id"]
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid group id")
+		return
+	}
+	if err := s.db.DeleteKeyGroup(id); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

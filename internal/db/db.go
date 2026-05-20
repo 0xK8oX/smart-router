@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,7 +33,10 @@ var migrations = []string{
 	`CREATE INDEX IF NOT EXISTS idx_stats_plan ON request_stats(plan);`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_provider ON request_stats(provider);`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_created ON request_stats(created_at);`,
+	`ALTER TABLE request_stats ADD COLUMN client_key TEXT;`,
+	`ALTER TABLE request_stats ADD COLUMN key_mask TEXT;`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_client_key ON request_stats(client_key);`,
+	`CREATE INDEX IF NOT EXISTS idx_stats_client_created ON request_stats(client_key, created_at);`,
 	`CREATE TABLE IF NOT EXISTS plans (
 		slug TEXT PRIMARY KEY,
 		config TEXT NOT NULL
@@ -53,6 +57,9 @@ var migrations = []string{
 		last_used_at INTEGER
 	);`,
 	`CREATE INDEX IF NOT EXISTS idx_api_keys_disabled ON api_keys(disabled);`,
+	`CREATE INDEX IF NOT EXISTS idx_api_keys_name ON api_keys(name);`,
+	`ALTER TABLE api_keys ADD COLUMN webhook_url TEXT;`,
+	`ALTER TABLE api_keys ADD COLUMN group_id INTEGER;`,
 	`CREATE TABLE IF NOT EXISTS audit_log (
 		id INTEGER PRIMARY KEY,
 		action TEXT NOT NULL,
@@ -114,12 +121,18 @@ func Open(path string) (*DB, error) {
 	}
 
 	db.startStatWorker()
+	db.startCleanupWorker()
 	return db, nil
 }
 
 func (d *DB) migrate() error {
 	for _, stmt := range migrations {
 		if _, err := d.conn.Exec(stmt); err != nil {
+			// Ignore "duplicate column name" errors from ALTER TABLE ADD COLUMN
+			// so migrations are idempotent on existing databases.
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
 			return err
 		}
 	}
@@ -221,6 +234,27 @@ func (d *DB) startStatWorker() {
 	}()
 }
 
+func (d *DB) startCleanupWorker() {
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				// Keep last 90 days of stats
+				cutoff := time.Now().Add(-90 * 24 * time.Hour).UnixMilli()
+				if _, err := d.conn.Exec(`DELETE FROM request_stats WHERE created_at < ?`, cutoff); err != nil {
+					log.Printf("[DB] stats cleanup failed: %v", err)
+				}
+			case <-d.stopChan:
+				return
+			}
+		}
+	}()
+}
+
 // RecordStatAsync sends a stat record to the background worker.
 // If the channel is full, it falls back to synchronous insertion.
 func (d *DB) RecordStatAsync(r types.StatRecord) {
@@ -235,6 +269,10 @@ func (d *DB) RecordStatAsync(r types.StatRecord) {
 }
 
 func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, error) {
+	const maxLimit = 10000
+	if limit <= 0 || limit > maxLimit {
+		limit = maxLimit
+	}
 	query := `
 		SELECT plan, provider, model, key_mask, client_key, request_tokens, response_tokens, total_tokens, status, latency_ms, is_streaming, target_provider
 		FROM request_stats
@@ -250,12 +288,8 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 		args = append(args, provider)
 	}
 
-	query += ` ORDER BY created_at DESC`
-
-	if limit > 0 {
-		query += ` LIMIT ?`
-		args = append(args, limit)
-	}
+	query += ` ORDER BY created_at DESC LIMIT ?`
+	args = append(args, limit)
 
 	rows, err := d.conn.Query(query, args...)
 	if err != nil {
@@ -463,6 +497,8 @@ func scanAPIKey(rows *sql.Rows) (types.APIKey, error) {
 	var disabled int
 	var lastUsed sql.NullInt64
 	var expiresAt sql.NullInt64
+	var groupID sql.NullInt64
+	var webhookURL sql.NullString
 	err := rows.Scan(
 		&k.Key,
 		&k.Name,
@@ -477,6 +513,8 @@ func scanAPIKey(rows *sql.Rows) (types.APIKey, error) {
 		&disabled,
 		&k.CreatedAt,
 		&lastUsed,
+		&webhookURL,
+		&groupID,
 	)
 	if err != nil {
 		return k, err
@@ -488,10 +526,25 @@ func scanAPIKey(rows *sql.Rows) (types.APIKey, error) {
 	if lastUsed.Valid {
 		k.LastUsedAt = &lastUsed.Int64
 	}
+	if groupID.Valid {
+		k.GroupID = &groupID.Int64
+	}
+	if webhookURL.Valid {
+		k.WebhookURL = webhookURL.String
+	}
 	_ = json.Unmarshal([]byte(plansJSON), &k.Plans)
 	_ = json.Unmarshal([]byte(modelsJSON), &k.Models)
 	_ = json.Unmarshal([]byte(ipsJSON), &k.AllowedIPs)
 	return k, nil
+}
+
+func (d *DB) CountAPIKeys() (int, error) {
+	var count int
+	err := d.conn.QueryRow(`SELECT COUNT(*) FROM api_keys`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count api keys: %w", err)
+	}
+	return count, nil
 }
 
 func (d *DB) CreateAPIKey(key types.APIKey) error {
@@ -502,13 +555,17 @@ func (d *DB) CreateAPIKey(key types.APIKey) error {
 	if key.ExpiresAt != nil {
 		expiresAt = *key.ExpiresAt
 	}
+	var groupID interface{}
+	if key.GroupID != nil {
+		groupID = *key.GroupID
+	}
 	_, err := d.conn.Exec(`
 		INSERT INTO api_keys
-			(key, name, plans, models, allowed_ips, rate_limit_rpm, rate_limit_rpd, monthly_token_limit, monthly_request_limit, expires_at, disabled, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(key, name, plans, models, allowed_ips, rate_limit_rpm, rate_limit_rpd, monthly_token_limit, monthly_request_limit, expires_at, disabled, created_at, webhook_url, group_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, key.Key, key.Name, string(plansJSON), string(modelsJSON), string(ipsJSON),
 		key.RateLimitRPM, key.RateLimitRPD, key.MonthlyTokenLimit, key.MonthlyRequestLimit,
-		expiresAt, 0, key.CreatedAt)
+		expiresAt, 0, key.CreatedAt, key.WebhookURL, groupID)
 	if err != nil {
 		return fmt.Errorf("create api key: %w", err)
 	}
@@ -518,7 +575,7 @@ func (d *DB) CreateAPIKey(key types.APIKey) error {
 func (d *DB) GetAPIKey(key string) (*types.APIKey, error) {
 	rows, err := d.conn.Query(`
 		SELECT key, name, plans, models, allowed_ips, rate_limit_rpm, rate_limit_rpd,
-			monthly_token_limit, monthly_request_limit, expires_at, disabled, created_at, last_used_at
+			monthly_token_limit, monthly_request_limit, expires_at, disabled, created_at, last_used_at, webhook_url, group_id
 		FROM api_keys WHERE key = ?
 	`, key)
 	if err != nil {
@@ -535,10 +592,30 @@ func (d *DB) GetAPIKey(key string) (*types.APIKey, error) {
 	return &k, nil
 }
 
+func (d *DB) GetAPIKeyByName(name string) (*types.APIKey, error) {
+	rows, err := d.conn.Query(`
+		SELECT key, name, plans, models, allowed_ips, rate_limit_rpm, rate_limit_rpd,
+			monthly_token_limit, monthly_request_limit, expires_at, disabled, created_at, last_used_at, webhook_url, group_id
+		FROM api_keys WHERE name = ?
+	`, name)
+	if err != nil {
+		return nil, fmt.Errorf("query api key by name: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, fmt.Errorf("api key not found")
+	}
+	k, err := scanAPIKey(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan api key: %w", err)
+	}
+	return &k, nil
+}
+
 func (d *DB) ListAPIKeys() ([]types.APIKey, error) {
 	rows, err := d.conn.Query(`
 		SELECT key, name, plans, models, allowed_ips, rate_limit_rpm, rate_limit_rpd,
-			monthly_token_limit, monthly_request_limit, expires_at, disabled, created_at, last_used_at
+			monthly_token_limit, monthly_request_limit, expires_at, disabled, created_at, last_used_at, webhook_url, group_id
 		FROM api_keys ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -568,17 +645,21 @@ func (d *DB) UpdateAPIKey(key string, updates types.APIKey) error {
 	if updates.ExpiresAt != nil {
 		expiresAt = *updates.ExpiresAt
 	}
+	var groupID interface{}
+	if updates.GroupID != nil {
+		groupID = *updates.GroupID
+	}
 	_, err := d.conn.Exec(`
 		UPDATE api_keys SET
 			name = ?, plans = ?, models = ?, allowed_ips = ?,
 			rate_limit_rpm = ?, rate_limit_rpd = ?,
 			monthly_token_limit = ?, monthly_request_limit = ?,
-			expires_at = ?, disabled = ?
+			expires_at = ?, disabled = ?, webhook_url = ?, group_id = ?
 		WHERE key = ?
 	`, updates.Name, string(plansJSON), string(modelsJSON), string(ipsJSON),
 		updates.RateLimitRPM, updates.RateLimitRPD,
 		updates.MonthlyTokenLimit, updates.MonthlyRequestLimit,
-		expiresAt, updates.Disabled, key)
+		expiresAt, updates.Disabled, updates.WebhookURL, groupID, key)
 	if err != nil {
 		return fmt.Errorf("update api key: %w", err)
 	}
@@ -593,8 +674,110 @@ func (d *DB) DeleteAPIKey(key string) error {
 	return nil
 }
 
+// --- Key Groups ---
+
+func (d *DB) CreateKeyGroup(g types.KeyGroup) (int64, error) {
+	res, err := d.conn.Exec(`
+		INSERT INTO key_groups (name, monthly_token_limit, monthly_request_limit, monthly_budget_limit, webhook_url)
+		VALUES (?, ?, ?, ?, ?)
+	`, g.Name, g.MonthlyTokenLimit, g.MonthlyRequestLimit, g.MonthlyBudgetLimit, g.WebhookURL)
+	if err != nil {
+		return 0, fmt.Errorf("create key group: %w", err)
+	}
+	id, _ := res.LastInsertId()
+	return id, nil
+}
+
+func (d *DB) GetKeyGroup(id int64) (*types.KeyGroup, error) {
+	var g types.KeyGroup
+	var webhookURL sql.NullString
+	err := d.conn.QueryRow(`
+		SELECT id, name, monthly_token_limit, monthly_request_limit, monthly_budget_limit, webhook_url
+		FROM key_groups WHERE id = ?
+	`, id).Scan(&g.ID, &g.Name, &g.MonthlyTokenLimit, &g.MonthlyRequestLimit, &g.MonthlyBudgetLimit, &webhookURL)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("key group not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get key group: %w", err)
+	}
+	g.WebhookURL = webhookURL.String
+	return &g, nil
+}
+
+func (d *DB) ListKeyGroups() ([]types.KeyGroup, error) {
+	rows, err := d.conn.Query(`
+		SELECT id, name, monthly_token_limit, monthly_request_limit, monthly_budget_limit, webhook_url
+		FROM key_groups ORDER BY id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list key groups: %w", err)
+	}
+	defer rows.Close()
+
+	var results []types.KeyGroup
+	for rows.Next() {
+		var g types.KeyGroup
+		var webhookURL sql.NullString
+		if err := rows.Scan(&g.ID, &g.Name, &g.MonthlyTokenLimit, &g.MonthlyRequestLimit, &g.MonthlyBudgetLimit, &webhookURL); err != nil {
+			return nil, fmt.Errorf("scan key group: %w", err)
+		}
+		g.WebhookURL = webhookURL.String
+		results = append(results, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+	return results, nil
+}
+
+func (d *DB) UpdateKeyGroup(id int64, g types.KeyGroup) error {
+	_, err := d.conn.Exec(`
+		UPDATE key_groups SET
+			name = ?, monthly_token_limit = ?, monthly_request_limit = ?, monthly_budget_limit = ?, webhook_url = ?
+		WHERE id = ?
+	`, g.Name, g.MonthlyTokenLimit, g.MonthlyRequestLimit, g.MonthlyBudgetLimit, g.WebhookURL, id)
+	if err != nil {
+		return fmt.Errorf("update key group: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) DeleteKeyGroup(id int64) error {
+	_, err := d.conn.Exec(`DELETE FROM key_groups WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete key group: %w", err)
+	}
+	return nil
+}
+
+func (d *DB) GetGroupMonthlyUsage(groupID int64, year, month int) (*MonthlyUsage, error) {
+	start := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 1, 0)
+	var reqTokens, respTokens, reqCount sql.NullInt64
+	err := d.conn.QueryRow(`
+		SELECT COALESCE(SUM(request_tokens), 0), COALESCE(SUM(response_tokens), 0), COALESCE(COUNT(*), 0)
+		FROM request_stats
+		WHERE client_key IN (SELECT key FROM api_keys WHERE group_id = ?)
+			AND created_at >= ? AND created_at < ? AND status = 'success'
+	`, groupID, start.UnixMilli(), end.UnixMilli()).Scan(&reqTokens, &respTokens, &reqCount)
+	if err != nil {
+		return nil, fmt.Errorf("query group monthly usage: %w", err)
+	}
+	return &MonthlyUsage{
+		RequestTokens:  reqTokens.Int64,
+		ResponseTokens: respTokens.Int64,
+		RequestCount:   reqCount.Int64,
+	}, nil
+}
+
 func (d *DB) UpdateKeyLastUsed(key string) error {
 	_, err := d.conn.Exec(`UPDATE api_keys SET last_used_at = ? WHERE key = ?`, time.Now().Unix(), key)
+	return err
+}
+
+func (d *DB) UpdateKeyLastUsedWithTime(key string, ts int64) error {
+	_, err := d.conn.Exec(`UPDATE api_keys SET last_used_at = ? WHERE key = ?`, ts, key)
 	return err
 }
 
@@ -646,7 +829,7 @@ func (d *DB) RecordAudit(action, targetKey, actor, details string) error {
 }
 
 func (d *DB) ListAuditLogs(limit int) ([]map[string]interface{}, error) {
-	query := `SELECT id, action, target_key, actor, details, created_at FROM audit_log ORDER BY created_at DESC`
+	query := `SELECT id, action, target_key, actor, details, created_at FROM audit_log ORDER BY created_at DESC, id DESC`
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
