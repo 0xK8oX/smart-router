@@ -87,7 +87,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Plan, X-Admin-Key, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -279,23 +279,29 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 		return
 	}
 
-	planSlug := r.Header.Get("X-Plan")
+	// Resolve plan: auth middleware already extracted it from body and stored in context.
+	// For unauthenticated paths, resolve from body directly.
+	planSlug := PlanSlugFromContext(r.Context())
 	if planSlug == "" {
-		planSlug = "default"
-	}
-
-	// Check for auto- prefix in model field
-	if model, ok := body["model"].(string); ok && strings.HasPrefix(model, "auto-") {
-		planSlug = strings.TrimPrefix(model, "auto-")
-		body["model"] = "auto"
-	}
-
-	// Support plan/model syntax: e.g. "chat2api/DeepSeek-V4-Pro" or "sam/kimi-k2.6"
-	if model, ok := body["model"].(string); ok && strings.Contains(model, "/") {
-		parts := strings.SplitN(model, "/", 2)
-		if len(parts) == 2 {
-			planSlug = parts[0]
-			body["model"] = parts[1]
+		planSlug = resolvePlanFromBody(body)
+		// Mutate body model field so downstream sees only the actual model name
+		if model, ok := body["model"].(string); ok && strings.HasPrefix(model, "auto-") {
+			body["model"] = "auto"
+		} else if model, ok := body["model"].(string); ok && strings.Contains(model, "/") {
+			parts := strings.SplitN(model, "/", 2)
+			if len(parts) == 2 {
+				body["model"] = parts[1]
+			}
+		}
+	} else {
+		// Auth already resolved plan; still need to strip plan prefix from model for downstream
+		if model, ok := body["model"].(string); ok && strings.HasPrefix(model, "auto-") {
+			body["model"] = "auto"
+		} else if model, ok := body["model"].(string); ok && strings.Contains(model, "/") {
+			parts := strings.SplitN(model, "/", 2)
+			if len(parts) == 2 {
+				body["model"] = parts[1]
+			}
 		}
 	}
 

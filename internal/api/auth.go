@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -21,7 +24,22 @@ type contextKey int
 const (
 	clientKeyContextKey contextKey = iota
 	apiKeyContextKey
+	planSlugContextKey
 )
+
+// resolvePlanFromBody extracts the plan slug from the request body model field.
+// Supports auto-<plan> prefix and plan/model syntax.
+func resolvePlanFromBody(body map[string]interface{}) string {
+	planSlug := "default"
+	if model, ok := body["model"].(string); ok {
+		if strings.HasPrefix(model, "auto-") {
+			planSlug = strings.TrimPrefix(model, "auto-")
+		} else if idx := strings.Index(model, "/"); idx > 0 {
+			planSlug = model[:idx]
+		}
+	}
+	return planSlug
+}
 
 // Auth handles API key validation, rate limiting, and quota enforcement.
 type Auth struct {
@@ -134,11 +152,12 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 			}
 		}
 
-		// Extract requested plan from header or body (same logic as handler)
-		planSlug := r.Header.Get("X-Plan")
-		if planSlug == "" {
-			planSlug = "default"
-		}
+		// Extract requested plan from body (supports auto-<plan> and plan/model syntax)
+		bodyBytes, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		var body map[string]interface{}
+		_ = json.Unmarshal(bodyBytes, &body)
+		planSlug := resolvePlanFromBody(body)
 
 		// Plan access check
 		if len(apiKey.Plans) > 0 {
@@ -207,6 +226,7 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 
 		ctx := context.WithValue(r.Context(), clientKeyContextKey, token)
 		ctx = context.WithValue(ctx, apiKeyContextKey, apiKey)
+		ctx = context.WithValue(ctx, planSlugContextKey, planSlug)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -225,6 +245,14 @@ func APIKeyFromContext(ctx context.Context) *types.APIKey {
 		return v
 	}
 	return nil
+}
+
+// PlanSlugFromContext extracts the resolved plan slug from the request context.
+func PlanSlugFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(planSlugContextKey).(string); ok {
+		return v
+	}
+	return ""
 }
 
 func (a *Auth) getKeyCached(key string) (*types.APIKey, error) {

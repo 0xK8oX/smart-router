@@ -96,9 +96,8 @@ func TestAuthMiddleware_HermesM1(t *testing.T) {
 	}
 
 	// 5. Request with valid key to denied plan — should 403
-	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"premium/gpt-4"}`))
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("X-Plan", "premium")
 	rr = httptest.NewRecorder()
 	a.Middleware(next).ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
@@ -247,9 +246,8 @@ func TestAuthMiddleware_PlanWildcard(t *testing.T) {
 
 	// Any plan should work
 	for _, plan := range []string{"default", "premium", "nonexistent"} {
-		req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
+		req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"`+plan+`/gpt-4"}`))
 		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("X-Plan", plan)
 		rr = httptest.NewRecorder()
 		a.Middleware(next).ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
@@ -752,7 +750,7 @@ func TestMiddleware_PlanNotAllowed(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	// No X-Plan header → defaults to "default" which is not in key's plans
+	// Empty body → plan defaults to "default" which is not in key's plans
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer "+key.Key)
 	rr := httptest.NewRecorder()
@@ -782,9 +780,8 @@ func TestMiddleware_PlanWildcardAllowed(t *testing.T) {
 	}))
 
 	for _, plan := range []string{"default", "premium", "nonexistent"} {
-		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"`+plan+`/gpt-4"}`))
 		req.Header.Set("Authorization", "Bearer "+key.Key)
-		req.Header.Set("X-Plan", plan)
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
