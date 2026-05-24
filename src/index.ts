@@ -15,7 +15,7 @@
 
 import { HealthTracker } from "./health-do";
 import { routeRequest } from "./router";
-import type { ClientFormat } from "./types";
+import type { ClientFormat, APIKey } from "./types";
 import { queryStats, aggregateStats } from "./stats";
 import {
   initDb,
@@ -23,8 +23,10 @@ import {
   listPlans,
   deletePlan,
 } from "./db";
-import { upsertPlan } from "./config";
+import { upsertPlan, listPlanNames } from "./config";
 import { decryptKey } from "./crypto";
+import { validateKey, generateAPIKey, maskAPIKey } from "./auth";
+import { createKey, listKeys, getKey, updateKey, deleteKey } from "./keys";
 
 export { HealthTracker };
 
@@ -128,6 +130,30 @@ export default {
     }
     if (path === "/v1/stats/aggregated" && request.method === "GET") {
       return handleAggregateStats(url, env);
+    }
+
+    // ── API Key Management (admin only) ──────────────────────────────────
+    if (path === "/v1/keys") {
+      if (request.method === "GET") {
+        return handleListKeys(request, env);
+      }
+      if (request.method === "POST") {
+        return handleCreateKey(request, env);
+      }
+    }
+
+    const keyMatch = path.match(/^\/v1\/keys\/([^/]+)$/);
+    if (keyMatch) {
+      const key = decodeURIComponent(keyMatch[1]);
+      if (request.method === "GET") {
+        return handleGetKey(request, key, env);
+      }
+      if (request.method === "PUT") {
+        return handleUpdateKey(request, key, env);
+      }
+      if (request.method === "DELETE") {
+        return handleDeleteKey(request, key, env);
+      }
     }
 
     return new Response(JSON.stringify({ error: "Not found" }), {
@@ -388,6 +414,111 @@ async function handleStatus(env: Env): Promise<Response> {
   );
 }
 
+// ── API Key Management Handlers ──────────────────────────────────────────
+
+async function requireAdmin(request: Request, env: Env): Promise<Response | null> {
+  if (!isAdmin(request, env)) {
+    return new Response(JSON.stringify({ error: "Forbidden" }), {
+      status: 403,
+      headers: { ...corsHeaders(), "Content-Type": "application/json" },
+    });
+  }
+  return null;
+}
+
+async function handleListKeys(request: Request, env: Env): Promise<Response> {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+
+  const keys = await listKeys(env.DB);
+  return new Response(
+    JSON.stringify(keys.map((k) => ({ ...k, key: maskAPIKey(k.key) }))),
+    { headers: { ...corsHeaders(), "Content-Type": "application/json" } }
+  );
+}
+
+async function handleCreateKey(request: Request, env: Env): Promise<Response> {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+      status: 400,
+      headers: { ...corsHeaders(), "Content-Type": "application/json" },
+    });
+  }
+
+  const payload = body as Partial<APIKey>;
+  const key: APIKey = {
+    key: generateAPIKey(),
+    name: payload.name ?? "",
+    plans: payload.plans ?? [],
+    models: payload.models ?? [],
+    rate_limit_rpm: payload.rate_limit_rpm ?? 0,
+    rate_limit_rpd: payload.rate_limit_rpd ?? 0,
+    monthly_token_limit: payload.monthly_token_limit ?? 0,
+    monthly_request_limit: payload.monthly_request_limit ?? 0,
+    expires_at: payload.expires_at,
+    disabled: false,
+    created_at: Date.now(),
+  };
+
+  await createKey(env.DB, key);
+  return new Response(JSON.stringify({ ok: true, key: key.key }), {
+    headers: { ...corsHeaders(), "Content-Type": "application/json" },
+  });
+}
+
+async function handleGetKey(request: Request, key: string, env: Env): Promise<Response> {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+
+  const record = await getKey(env.DB, key);
+  if (!record) {
+    return new Response(JSON.stringify({ error: "Key not found" }), {
+      status: 404,
+      headers: { ...corsHeaders(), "Content-Type": "application/json" },
+    });
+  }
+  return new Response(JSON.stringify(record), {
+    headers: { ...corsHeaders(), "Content-Type": "application/json" },
+  });
+}
+
+async function handleUpdateKey(request: Request, key: string, env: Env): Promise<Response> {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+      status: 400,
+      headers: { ...corsHeaders(), "Content-Type": "application/json" },
+    });
+  }
+
+  const payload = body as Partial<APIKey>;
+  await updateKey(env.DB, key, payload);
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: { ...corsHeaders(), "Content-Type": "application/json" },
+  });
+}
+
+async function handleDeleteKey(request: Request, key: string, env: Env): Promise<Response> {
+  const denied = await requireAdmin(request, env);
+  if (denied) return denied;
+
+  await deleteKey(env.DB, key);
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: { ...corsHeaders(), "Content-Type": "application/json" },
+  });
+}
+
 function parseTimeParam(value: string | null): number | undefined {
   if (!value) return undefined;
   const num = parseInt(value, 10);
@@ -416,14 +547,41 @@ async function handleChatRequest(
   }
 
   const url = new URL(request.url);
-  const plan = request.headers.get("X-Plan") || url.searchParams.get("plan") || "default";
+  let plan = request.headers.get("X-Plan") || url.searchParams.get("plan") || "default";
   const isStreaming = (body as Record<string, unknown>)?.stream === true;
+
+  // Extract client API key from Authorization header
+  const authHeader = request.headers.get("Authorization") ?? "";
+  const clientKey = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+
+  // Determine model for validation
+  const model = (body as Record<string, unknown>)?.model as string || "";
+
+  // If model field matches a plan name, route to that plan
+  if (model) {
+    const planNames = await listPlanNames(env);
+    if (planNames.has(model)) {
+      plan = model;
+    }
+  }
+
+  // Validate API key if provided
+  if (clientKey) {
+    const auth = await validateKey(env.DB, clientKey, plan, model);
+    if (!auth.ok) {
+      return new Response(JSON.stringify({ error: auth.message }), {
+        status: auth.status,
+        headers: { ...corsHeaders(), "Content-Type": "application/json" },
+      });
+    }
+  }
 
   const routerReq = {
     body,
     clientFormat,
     plan,
     isStreaming,
+    clientKey,
   };
 
   const response = await routeRequest(routerReq, env, ctx);

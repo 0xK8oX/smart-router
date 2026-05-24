@@ -16,6 +16,8 @@ export interface ProviderConfig {
   context_length?: number;
   /** Optional override for max_output_tokens. If omitted, falls back to registry then 4096. */
   max_output_tokens?: number;
+  /** Optional explicit endpoint URL. If set, used directly instead of building from base_url + format. */
+  endpoint?: string;
 }
 
 export interface PlanConfig {
@@ -45,6 +47,7 @@ export interface RouterRequest {
   clientFormat: ClientFormat;
   plan: string;
   isStreaming: boolean;
+  clientKey?: string;
 }
 
 export interface TranslatedRequest {
@@ -59,6 +62,7 @@ export interface StatRecord {
   provider: string;
   model: string;
   key_mask?: string;
+  client_key?: string;
   request_tokens: number;
   response_tokens: number;
   total_tokens: number;
@@ -67,6 +71,21 @@ export interface StatRecord {
   is_streaming: boolean;
   /** For virtual providers: the actual provider in the target plan that served the request */
   target_provider?: string;
+}
+
+export interface APIKey {
+  key: string;
+  name: string;
+  plans: string[];
+  models: string[];
+  rate_limit_rpm: number;
+  rate_limit_rpd: number;
+  monthly_token_limit: number;
+  monthly_request_limit: number;
+  expires_at?: number;
+  disabled: boolean;
+  created_at: number;
+  last_used_at?: number;
 }
 
 export interface AggregateOptions {

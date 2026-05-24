@@ -7,11 +7,27 @@
  */
 
 import type { ProviderConfig, PlanConfig } from "./types";
-import { getPlan as dbGetPlan, upsertPlan as dbUpsertPlan, maskKey } from "./db";
+import { getPlan as dbGetPlan, upsertPlan as dbUpsertPlan, maskKey, listPlans } from "./db";
 import { decryptKey, encryptKey } from "./crypto";
 
 const planCache = new Map<string, { config: PlanConfig; ts: number }>();
 const CACHE_TTL_MS = 60_000;
+
+let planNamesCache: { names: Set<string>; ts: number } | null = null;
+const PLAN_NAMES_CACHE_TTL = 30_000;
+
+/**
+ * Get all plan names from D1 with in-memory caching.
+ */
+export async function listPlanNames(env: Env): Promise<Set<string>> {
+  if (planNamesCache && Date.now() - planNamesCache.ts < PLAN_NAMES_CACHE_TTL) {
+    return planNamesCache.names;
+  }
+  const plans = await listPlans(env.DB);
+  const names = new Set(Object.keys(plans));
+  planNamesCache = { names, ts: Date.now() };
+  return names;
+}
 
 async function loadAndDecryptPlan(
   db: D1Database,
@@ -107,5 +123,6 @@ export async function upsertPlan(
 
   await dbUpsertPlan(db, slug, { providers });
   planCache.delete(slug);
+  planNamesCache = null;
 }
 

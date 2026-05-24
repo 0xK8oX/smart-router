@@ -1,6 +1,7 @@
 name = "smart-router"
 main = "src/index.ts"
 compatibility_date = "2025-04-24"
+account_id = "7ea3dc9139987ae3914ad3e76676dbca"
 
 # Durable Object binding for health tracking (circuit breaker)
 [[durable_objects.bindings]]
@@ -9,10 +10,10 @@ class_name = "HealthTracker"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["HealthTracker"]
+new_sqlite_classes = ["HealthTracker"]
 
 # D1 database for plan storage
 [[d1_databases]]
 binding = "DB"
 database_name = "smart-router-db"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "c01ced39-8310-47f5-931e-118a11f31437"

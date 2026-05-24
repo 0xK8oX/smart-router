@@ -43,13 +43,18 @@ export async function callProvider(
     } else if (isKimiCodingEndpoint(provider.base_url)) {
       // Kimi's /coding endpoint requires User-Agent: claude-code/0.1.0
       // to be recognized as a valid Coding Agent. Without it, returns 403.
-      headers["Authorization"] = `Bearer ${apiKey}`;
       headers["User-Agent"] = "claude-code/0.1.0";
+      if (provider.format === "anthropic") {
+        headers["x-api-key"] = apiKey;
+        headers["anthropic-version"] = "2023-06-01";
+      } else {
+        headers["Authorization"] = `Bearer ${apiKey}`;
+      }
     } else {
       headers["Authorization"] = `Bearer ${apiKey}`;
     }
 
-    const endpoint = buildEndpoint(provider.base_url, provider.format);
+    const endpoint = provider.endpoint ?? buildEndpoint(provider.base_url, provider.format);
 
     const response = await fetch(endpoint, {
       method: "POST",

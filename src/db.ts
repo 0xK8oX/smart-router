@@ -52,6 +52,27 @@ export async function initDb(db: D1Database): Promise<void> {
   } catch { /* already exists */ }
 
   await initStatsTable(db);
+
+  // API keys table
+  await db.prepare(
+    "CREATE TABLE IF NOT EXISTS api_keys (" +
+    "key TEXT PRIMARY KEY, " +
+    "name TEXT NOT NULL DEFAULT '', " +
+    "plans TEXT NOT NULL DEFAULT '[]', " +
+    "models TEXT NOT NULL DEFAULT '[]', " +
+    "rate_limit_rpm INTEGER NOT NULL DEFAULT 0, " +
+    "rate_limit_rpd INTEGER NOT NULL DEFAULT 0, " +
+    "monthly_token_limit INTEGER NOT NULL DEFAULT 0, " +
+    "monthly_request_limit INTEGER NOT NULL DEFAULT 0, " +
+    "expires_at INTEGER, " +
+    "disabled INTEGER NOT NULL DEFAULT 0, " +
+    "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000), " +
+    "last_used_at INTEGER)"
+  ).run();
+
+  await db.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_api_keys_disabled ON api_keys(disabled)"
+  ).run();
 }
 
 export async function seedPlansIfEmpty(db: D1Database): Promise<void> {

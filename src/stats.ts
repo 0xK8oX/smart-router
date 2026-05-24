@@ -15,6 +15,7 @@ export async function initStatsTable(db: D1Database): Promise<void> {
     "provider TEXT NOT NULL, " +
     "model TEXT NOT NULL, " +
     "key_mask TEXT, " +
+    "client_key TEXT, " +
     "request_tokens INTEGER DEFAULT 0, " +
     "response_tokens INTEGER DEFAULT 0, " +
     "total_tokens INTEGER DEFAULT 0, " +
@@ -36,19 +37,27 @@ export async function initStatsTable(db: D1Database): Promise<void> {
   await db.prepare(
     "CREATE INDEX IF NOT EXISTS idx_stats_created ON request_stats(created_at)"
   ).run();
+  // Migration: add client_key if missing
+  try {
+    await db.prepare("ALTER TABLE request_stats ADD COLUMN client_key TEXT").run();
+  } catch { /* already exists */ }
+  await db.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_stats_client_key ON request_stats(client_key, created_at)"
+  ).run();
 }
 
 export async function recordStat(db: D1Database, stat: StatRecord): Promise<void> {
   try {
     await db.prepare(
       "INSERT INTO request_stats " +
-      "(plan, provider, model, key_mask, request_tokens, response_tokens, total_tokens, status, latency_ms, is_streaming, created_at) " +
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "(plan, provider, model, key_mask, client_key, request_tokens, response_tokens, total_tokens, status, latency_ms, is_streaming, created_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ).bind(
       stat.plan,
       stat.provider,
       stat.model,
       stat.key_mask ?? null,
+      stat.client_key ?? null,
       stat.request_tokens,
       stat.response_tokens,
       stat.total_tokens,
@@ -193,4 +202,65 @@ export function extractUsage(responseBody: any): { request_tokens: number; respo
     request_tokens: Number(reqTokens) || 0,
     response_tokens: Number(resTokens) || 0,
   };
+}
+
+export async function getKeyUsageSince(
+  db: D1Database,
+  key: string,
+  since: number
+): Promise<{ request_tokens: number; response_tokens: number; request_count: number }> {
+  try {
+    const result = await db
+      .prepare(
+        "SELECT SUM(request_tokens) as request_tokens, SUM(response_tokens) as response_tokens, COUNT(*) as request_count " +
+        "FROM request_stats WHERE client_key = ? AND created_at > ? AND status = 'success'"
+      )
+      .bind(key, since)
+      .first();
+
+    if (!result) {
+      return { request_tokens: 0, response_tokens: 0, request_count: 0 };
+    }
+
+    return {
+      request_tokens: Number(result.request_tokens ?? 0),
+      response_tokens: Number(result.response_tokens ?? 0),
+      request_count: Number(result.request_count ?? 0),
+    };
+  } catch (err) {
+    console.log(`[STATS] FAILED to get key usage: ${err instanceof Error ? err.message : String(err)}`);
+    return { request_tokens: 0, response_tokens: 0, request_count: 0 };
+  }
+}
+
+export async function getKeyMonthlyUsage(
+  db: D1Database,
+  key: string,
+  year: number,
+  month: number
+): Promise<{ request_tokens: number; response_tokens: number; request_count: number }> {
+  const start = new Date(year, month - 1, 1).getTime();
+  const end = new Date(year, month, 1).getTime();
+  try {
+    const result = await db
+      .prepare(
+        "SELECT SUM(request_tokens) as request_tokens, SUM(response_tokens) as response_tokens, COUNT(*) as request_count " +
+        "FROM request_stats WHERE client_key = ? AND created_at >= ? AND created_at < ? AND status = 'success'"
+      )
+      .bind(key, start, end)
+      .first();
+
+    if (!result) {
+      return { request_tokens: 0, response_tokens: 0, request_count: 0 };
+    }
+
+    return {
+      request_tokens: Number(result.request_tokens ?? 0),
+      response_tokens: Number(result.response_tokens ?? 0),
+      request_count: Number(result.request_count ?? 0),
+    };
+  } catch (err) {
+    console.log(`[STATS] FAILED to get key monthly usage: ${err instanceof Error ? err.message : String(err)}`);
+    return { request_tokens: 0, response_tokens: 0, request_count: 0 };
+  }
 }

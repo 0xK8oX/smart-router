@@ -9,7 +9,7 @@
  */
 
 import type { ClientFormat, ProviderConfig, RouterRequest, TranslatedRequest, StatRecord } from "./types";
-import { getPlan } from "./config";
+import { getPlan, listPlanNames } from "./config";
 import { callProvider } from "./providers/client";
 import {
   translateRequestToProvider,
@@ -219,12 +219,13 @@ export async function routeRequest(
 ): Promise<Response> {
   const startTime = Date.now();
 
-  // Parse model hints like "auto-jason" -> plan="jason", model="auto"
+  // If model field matches a plan name, route to that plan
   let effectivePlan = req.plan;
   if (req.body && typeof req.body === "object" && typeof (req.body as Record<string, unknown>).model === "string") {
     const model = (req.body as Record<string, unknown>).model as string;
-    if (model.startsWith("auto-")) {
-      effectivePlan = model.slice(5);
+    const planNames = await listPlanNames(env);
+    if (planNames.has(model)) {
+      effectivePlan = model;
       req.body = { ...req.body, model: "auto" };
     }
   }
@@ -242,7 +243,7 @@ export async function routeRequest(
   let targetProvider: ProviderConfig | undefined;
   if (req.body && typeof req.body === "object" && typeof (req.body as Record<string, unknown>).model === "string") {
     const model = (req.body as Record<string, unknown>).model as string;
-    if (model !== "auto" && !model.startsWith("auto-")) {
+    if (model !== "auto") {
       targetProvider = planConfig.providers.find((p) => p.name === model);
       if (targetProvider) {
         req.body = { ...req.body, model: targetProvider.model };
@@ -300,6 +301,7 @@ export async function routeRequest(
       provider: partial.provider,
       model: partial.model,
       key_mask: partial.key_mask,
+      client_key: req.clientKey,
       request_tokens: partial.request_tokens ?? 0,
       response_tokens: partial.response_tokens ?? 0,
       total_tokens: (partial.request_tokens ?? 0) + (partial.response_tokens ?? 0),
@@ -459,6 +461,7 @@ export async function routeRequest(
             provider: provider.name,
             model: provider.model,
             key_mask: provider.masked_key,
+            client_key: req.clientKey,
             request_tokens: inputTokens,
             response_tokens: outputTokens,
             total_tokens: inputTokens + outputTokens,
@@ -497,6 +500,7 @@ export async function routeRequest(
             provider: provider.name,
             model: provider.model,
             key_mask: provider.masked_key,
+            client_key: req.clientKey,
             request_tokens: inputTokens,
             response_tokens: outputTokens,
             total_tokens: inputTokens + outputTokens,

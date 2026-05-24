@@ -5,6 +5,7 @@ import type { RouterRequest } from "./types";
 // Mock dependencies
 vi.mock("./config", () => ({
   getPlan: vi.fn(),
+  listPlanNames: vi.fn(() => Promise.resolve(new Set())),
 }));
 
 vi.mock("./providers/client", () => ({
