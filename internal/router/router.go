@@ -232,7 +232,7 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 				Provider:  provider.Name,
 				Model:     provider.Model,
 				KeyMask:   types.MaskAPIKey(provider.APIKey),
-				ClientKey: clientKey,
+				ClientKey: "",
 				Status:    "failure",
 			})
 			providerErrors = append(providerErrors, fmt.Sprintf("%s: translate error", provider.Name))
@@ -289,7 +289,7 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 		}
 
 		latencyMs := time.Since(start).Milliseconds()
-		log.Printf("[ROUTER] FAILURE: plan=%s provider=%s status=%d body=%.200s latency=%dms", planSlug, provider.Name, resp.StatusCode, errBody, latencyMs)
+		log.Printf("[ROUTER] FAILURE: plan=%s provider=%s status=%d latency=%dms", planSlug, provider.Name, resp.StatusCode, latencyMs)
 		_ = r.healthTracker.RecordFailure(provider.Name, resp.StatusCode, errBody)
 		r.db.RecordStatAsync(types.StatRecord{
 			Plan:        planSlug,
@@ -304,5 +304,5 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 		providerErrors = append(providerErrors, fmt.Sprintf("%s: HTTP %d %s", provider.Name, resp.StatusCode, errBody))
 	}
 
-	return nil, types.ProviderConfig{}, fmt.Errorf("all providers failed for plan %s: %v", planSlug, providerErrors)
+	return nil, types.ProviderConfig{}, fmt.Errorf("all providers failed for plan %s", planSlug)
 }

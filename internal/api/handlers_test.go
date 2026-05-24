@@ -161,7 +161,7 @@ func TestRecordSuccessStat(t *testing.T) {
 		Model:  "gpt-4",
 		APIKey: "sk-test-key",
 	}
-	recordSuccessStat(database, "pro", provider, 100, false, data, "openai", "sr-testkey")
+	recordSuccessStat(database, "pro", provider, 100, false, data, "openai", "sr-testkey", nil)
 
 	database.FlushStats()
 
@@ -186,8 +186,8 @@ func TestRecordSuccessStat(t *testing.T) {
 	if s.KeyMask != types.MaskAPIKey("sk-test-key") {
 		t.Errorf("key_mask mismatch: got %q, want %q", s.KeyMask, types.MaskAPIKey("sk-test-key"))
 	}
-	if s.ClientKey != "sr-testkey" {
-		t.Errorf("client_key mismatch: got %q, want %q", s.ClientKey, "sr-testkey")
+	if s.ClientKey != "" {
+		t.Errorf("client_key mismatch: got %q, want %q", s.ClientKey, "")
 	}
 	if s.RequestTokens != 10 {
 		t.Errorf("request_tokens mismatch: got %d, want %d", s.RequestTokens, 10)
@@ -213,7 +213,7 @@ func TestRecordSuccessStat_NoData(t *testing.T) {
 	database := setupTestDB(t)
 
 	provider := types.ProviderConfig{Name: "test", Model: "gpt-4"}
-	recordSuccessStat(database, "pro", provider, 50, true, nil, "openai", "")
+	recordSuccessStat(database, "pro", provider, 50, true, nil, "openai", "", nil)
 
 	database.FlushStats()
 
@@ -1330,10 +1330,10 @@ func TestMaskAPIKeyHandler(t *testing.T) {
 	tests := []struct {
 		input, want string
 	}{
-		{"sr-abc123def456", "sr-a****f456"},
-		{"short", "****"},
+		{"sr-abc123def456", "****f456"},
+		{"short", "****hort"},
 		{"", "****"},
-		{"exactly8!!", "exac****y8!!"},
+		{"exactly8!!", "****y8!!"},
 	}
 	for _, tt := range tests {
 		got := types.MaskAPIKey(tt.input)

@@ -2,9 +2,11 @@ package api
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -18,26 +20,29 @@ import (
 	"smart-router/internal/auth"
 	"smart-router/internal/db"
 	"smart-router/internal/health"
+	"smart-router/internal/tokenizer"
 	"smart-router/internal/router"
 	"smart-router/internal/translation"
 	"smart-router/internal/types"
 )
 
 type Server struct {
-	router   *router.Router
-	health   *health.HealthTracker
-	db       *db.DB
-	auth     *Auth
-	adminKey string
+	router           *router.Router
+	health           *health.HealthTracker
+	db               *db.DB
+	auth             *Auth
+	adminKey         string
+	adminRateLimiter *auth.RateLimiter
 }
 
 func NewServer(r *router.Router, h *health.HealthTracker, d *db.DB, a *Auth, adminKey string) *Server {
 	return &Server{
-		router:   r,
-		health:   h,
-		db:       d,
-		auth:     a,
-		adminKey: adminKey,
+		router:           r,
+		health:           h,
+		db:               d,
+		auth:             a,
+		adminKey:         adminKey,
+		adminRateLimiter: auth.NewRateLimiter(),
 	}
 }
 
@@ -176,17 +181,96 @@ func extractUsageFromStream(data []byte, format string) (reqTokens, respTokens i
 	return
 }
 
-func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig, latencyMs int64, isStreaming bool, data []byte, clientFormat string, clientKey string) {
+// isSaneUsage returns false when upstream token counts are clearly fake/placeholder.
+func isSaneUsage(reqTokens, respTokens int) bool {
+	if reqTokens == 0 && respTokens == 0 {
+		return false
+	}
+	if reqTokens == 1 && respTokens == 1 {
+		return false
+	}
+	return true
+}
+
+// countStreamOutput accumulates content text from captured SSE bytes and counts tokens.
+func countStreamOutput(data []byte, format string) int {
+	var content strings.Builder
+	events := bytes.Split(data, sseEventSep)
+	for _, event := range events {
+		lines := bytes.Split(event, sseLineSep)
+		var eventData []byte
+		for _, line := range lines {
+			line = bytes.TrimSpace(line)
+			if bytes.HasPrefix(line, sseDataPrefix) {
+				part := bytes.TrimSpace(bytes.TrimPrefix(line, sseDataPrefix))
+				eventData = append(eventData, part...)
+			}
+		}
+		if len(eventData) == 0 || bytes.Equal(eventData, sseDoneMarker) {
+			continue
+		}
+		var eventJSON map[string]interface{}
+		if err := json.Unmarshal(eventData, &eventJSON); err != nil {
+			continue
+		}
+		switch format {
+		case "anthropic":
+			if delta, ok := eventJSON["delta"].(map[string]interface{}); ok {
+				if text, ok := delta["text"].(string); ok {
+					content.WriteString(text)
+				}
+			}
+		default:
+			if choices, ok := eventJSON["choices"].([]interface{}); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]interface{}); ok {
+					if delta, ok := choice["delta"].(map[string]interface{}); ok {
+						if text, ok := delta["content"].(string); ok {
+							content.WriteString(text)
+						}
+					}
+				}
+			}
+		}
+	}
+	return tokenizer.CountString(content.String())
+}
+
+// fallbackCount counts tokens internally when upstream usage is fake/missing.
+func fallbackCount(reqBody map[string]interface{}, respData []byte, format string, isStreaming bool) (reqTokens, respTokens int) {
+	var messages []map[string]interface{}
+	if msgs, ok := reqBody["messages"].([]interface{}); ok {
+		for _, m := range msgs {
+			if msg, ok := m.(map[string]interface{}); ok {
+				messages = append(messages, msg)
+			}
+		}
+	}
+	reqTokens = tokenizer.CountMessages(messages)
+
+	if isStreaming {
+		respTokens = countStreamOutput(respData, format)
+	} else if format == "anthropic" {
+		respTokens = tokenizer.CountAnthropicResponse(respData)
+	} else {
+		respTokens = tokenizer.CountOpenAIResponse(respData)
+	}
+	return
+}
+
+func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig, latencyMs int64, isStreaming bool, data []byte, clientFormat string, clientKey string, reqBody map[string]interface{}) {
 	reqTokens, respTokens := 0, 0
 	if len(data) > 0 {
 		reqTokens, respTokens = extractUsage(data, clientFormat)
+	}
+	if !isSaneUsage(reqTokens, respTokens) {
+		reqTokens, respTokens = fallbackCount(reqBody, data, clientFormat, isStreaming)
 	}
 	db.RecordStatAsync(types.StatRecord{
 		Plan:           planSlug,
 		Provider:       provider.Name,
 		Model:          provider.Model,
 		KeyMask:        types.MaskAPIKey(provider.APIKey),
-		ClientKey:      clientKey,
+		ClientKey:      "",
 		RequestTokens:  reqTokens,
 		ResponseTokens: respTokens,
 		TotalTokens:    reqTokens + respTokens,
@@ -215,7 +299,7 @@ var streamBufPool = sync.Pool{
 	},
 }
 
-func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string, clientKey string) {
+func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string, clientKey string, reqBody map[string]interface{}) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Printf("streaming: ResponseWriter does not support flushing")
@@ -245,12 +329,15 @@ func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSl
 			}
 			latencyMs := time.Since(start).Milliseconds()
 			reqTokens, respTokens := extractUsageFromStream(captured, clientFormat)
+			if !isSaneUsage(reqTokens, respTokens) {
+				reqTokens, respTokens = fallbackCount(reqBody, captured, clientFormat, true)
+			}
 			s.db.RecordStatAsync(types.StatRecord{
 				Plan:           planSlug,
 				Provider:       provider.Name,
 				Model:          provider.Model,
 				KeyMask:        types.MaskAPIKey(provider.APIKey),
-				ClientKey:      clientKey,
+				ClientKey:      "",
 				RequestTokens:  reqTokens,
 				ResponseTokens: respTokens,
 				TotalTokens:    reqTokens + respTokens,
@@ -353,7 +440,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 		if provider.Format != clientFormat {
 			bodyReader = translation.SSETranslator(resp.Body, provider.Format, clientFormat)
 		}
-		s.proxyStream(w, bodyReader, planSlug, provider, start, clientFormat, clientKey)
+		s.proxyStream(w, bodyReader, planSlug, provider, start, clientFormat, clientKey, body)
 		return
 	}
 
@@ -372,7 +459,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 	}
 
 	latencyMs := time.Since(start).Milliseconds()
-	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat, clientKey)
+	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat, clientKey, body)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
@@ -465,7 +552,7 @@ func (s *Server) handleGetPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Header.Get("X-Admin-Key") != s.adminKey {
+	if !adminKeyValid(r.Header.Get("X-Admin-Key"), s.adminKey) {
 		masked := maskPlan(*plan)
 		writeJSON(w, http.StatusOK, masked)
 		return
@@ -480,8 +567,7 @@ func (s *Server) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Header.Get("X-Admin-Key") != s.adminKey {
-		writeError(w, http.StatusForbidden, "invalid admin key")
+	if !s.requireAdmin(w, r) {
 		return
 	}
 
@@ -507,8 +593,7 @@ func (s *Server) handleDeletePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Header.Get("X-Admin-Key") != s.adminKey {
-		writeError(w, http.StatusForbidden, "invalid admin key")
+	if !s.requireAdmin(w, r) {
 		return
 	}
 
@@ -731,8 +816,23 @@ func SeedPlansFromFile(database *db.DB, path string) error {
 	return nil
 }
 
-func requireAdmin(w http.ResponseWriter, r *http.Request, adminKey string) bool {
-	if r.Header.Get("X-Admin-Key") != adminKey {
+func adminKeyValid(provided, expected string) bool {
+	if len(provided) != len(expected) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
+}
+
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if clientIP == "" {
+		clientIP = r.RemoteAddr
+	}
+	if ok, _ := s.adminRateLimiter.Allow("admin:"+clientIP, 30, 1000); !ok {
+		writeError(w, http.StatusTooManyRequests, "admin rate limit exceeded")
+		return false
+	}
+	if !adminKeyValid(r.Header.Get("X-Admin-Key"), s.adminKey) {
 		writeError(w, http.StatusForbidden, "invalid admin key")
 		return false
 	}
@@ -744,7 +844,7 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	var req types.APIKey
@@ -767,7 +867,7 @@ func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	keys, err := s.db.ListAPIKeys()
@@ -787,7 +887,7 @@ func (s *Server) handleGetKey(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	key := mux.Vars(r)["key"]
@@ -804,7 +904,7 @@ func (s *Server) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	key := mux.Vars(r)["key"]
@@ -826,7 +926,7 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	key := mux.Vars(r)["key"]
@@ -843,7 +943,7 @@ func (s *Server) handleKeyUsage(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	key := mux.Vars(r)["key"]
@@ -871,7 +971,7 @@ func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	limit := 100
@@ -894,7 +994,7 @@ func (s *Server) handleListPricing(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "not yet implemented"})
@@ -905,7 +1005,7 @@ func (s *Server) handleSetPricing(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	model := mux.Vars(r)["model"]
@@ -929,7 +1029,7 @@ func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	groups, err := s.db.ListKeyGroups()
@@ -945,7 +1045,7 @@ func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	var req types.KeyGroup
@@ -966,7 +1066,7 @@ func (s *Server) handleGetGroup(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	idStr := mux.Vars(r)["id"]
@@ -993,7 +1093,7 @@ func (s *Server) handleUpdateGroup(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	idStr := mux.Vars(r)["id"]
@@ -1019,7 +1119,7 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if !requireAdmin(w, r, s.adminKey) {
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	idStr := mux.Vars(r)["id"]

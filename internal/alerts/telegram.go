@@ -147,6 +147,8 @@ func (b *Bot) buildReply(text string) string {
 		return b.cmdKey(args)
 	case "/keyusage":
 		return b.cmdKeyUsage(args)
+	case "/providers":
+		return b.cmdProviders()
 	case "/help", "/start":
 		return b.cmdHelp()
 	default:
@@ -428,6 +430,48 @@ func (b *Bot) cmdPlans() string {
 	return strings.Join(lines, "\n")
 }
 
+func (b *Bot) cmdProviders() string {
+	plans, err := b.db.ListPlans()
+	if err != nil {
+		return "Error listing plans."
+	}
+
+	var lines []string
+	lines = append(lines, "*Providers*")
+	seen := make(map[string]bool)
+
+	for _, plan := range plans {
+		for _, p := range plan.Providers {
+			if seen[p.Name] {
+				continue
+			}
+			seen[p.Name] = true
+
+			h, _ := b.health.GetHealth(p.Name)
+			statusEmoji := "🟢"
+			if h.Status == "unhealthy" {
+				statusEmoji = "🔴"
+			}
+
+			mask := p.MaskedKey
+			if mask == "" {
+				mask = types.MaskAPIKey(p.APIKey)
+			}
+			if mask == "" {
+				mask = "(no key)"
+			}
+
+			lines = append(lines, fmt.Sprintf("%s *%s* — `%s` model=%s format=%s", statusEmoji, p.Name, mask, p.Model, p.Format))
+		}
+	}
+
+	if len(seen) == 0 {
+		return "No providers configured."
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 func (b *Bot) cmdStatus() string {
 	plans, err := b.db.ListPlans()
 	if err != nil {
@@ -588,6 +632,7 @@ func (b *Bot) cmdHelp() string {
 /status — Overall system status
 /top — Top providers by usage
 /failures — Recent failed requests
+/providers — List all providers with masked keys
 /keys — List all API keys
 /key <key_or_name> — Show key details and usage
 /keyusage <key_or_name> [5h|1d|1w|30d|1m] — Usage for specific key
@@ -728,10 +773,7 @@ func (b *Bot) cmdKeyUsage(args []string) string {
 }
 
 func maskAPIKey(key string) string {
-	if len(key) <= 12 {
-		return "****"
-	}
-	return key[:6] + "****" + key[len(key)-4:]
+	return types.MaskAPIKey(key)
 }
 
 func formatHealth(name string, h types.ProviderHealth) string {

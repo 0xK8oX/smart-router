@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"encoding/base64"
+
 	"smart-router/internal/alerts"
 	"smart-router/internal/api"
 	"smart-router/internal/auth"
@@ -40,6 +42,32 @@ func main() {
 		log.Fatalf("open db: %v", err)
 	}
 	defer database.Close()
+
+	// Load provider API key encryption key if available
+	if encKeyB64 := os.Getenv("KEY_ENCRYPTION_KEY"); encKeyB64 != "" {
+		encKey, err := base64.StdEncoding.DecodeString(encKeyB64)
+		if err != nil {
+			log.Fatalf("decode KEY_ENCRYPTION_KEY: %v", err)
+		}
+		if len(encKey) != 32 {
+			log.Fatalf("KEY_ENCRYPTION_KEY must decode to 32 bytes (got %d)", len(encKey))
+		}
+		database.WithEncryptionKey(encKey)
+		log.Printf("Provider API key encryption enabled")
+
+		// Migrate any existing plaintext plans to encrypted
+		plans, err := database.ListPlans()
+		if err != nil {
+			log.Printf("warning: failed to list plans for encryption migration: %v", err)
+		} else {
+			for slug, plan := range plans {
+				if err := database.SavePlan(slug, plan); err != nil {
+					log.Printf("warning: failed to encrypt plan %s: %v", slug, err)
+				}
+			}
+			log.Printf("Encrypted %d existing plan(s)", len(plans))
+		}
+	}
 
 	ht, err := health.New(healthPath)
 	if err != nil {

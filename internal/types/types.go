@@ -75,9 +75,10 @@ type StatRecord struct {
 }
 
 // MaskAPIKey returns a masked version of an API key for display/logging.
+// Only the last 4 characters are preserved; everything else is masked.
 func MaskAPIKey(key string) string {
-	if len(key) <= 8 {
+	if len(key) <= 4 {
 		return "****"
 	}
-	return key[:4] + "****" + key[len(key)-4:]
+	return "****" + key[len(key)-4:]
 }

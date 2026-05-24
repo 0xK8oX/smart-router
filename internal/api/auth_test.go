@@ -591,8 +591,8 @@ func TestMaskAPIKey(t *testing.T) {
 	tests := []struct {
 		in, want string
 	}{
-		{"sr-abc123def456", "sr-a****f456"},
-		{"short", "****"},
+		{"sr-abc123def456", "****f456"},
+		{"short", "****hort"},
 		{"", "****"},
 	}
 	for _, tt := range tests {

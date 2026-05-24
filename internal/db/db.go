@@ -88,6 +88,12 @@ type DB struct {
 	statChan chan types.StatRecord
 	stopChan chan struct{}
 	wg       sync.WaitGroup
+	encKey   []byte
+}
+
+func (d *DB) WithEncryptionKey(key []byte) *DB {
+	d.encKey = key
+	return d
 }
 
 func Open(path string) (*DB, error) {
@@ -330,6 +336,20 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 }
 
 func (d *DB) SavePlan(slug string, config types.PlanConfig) error {
+	// Deep-copy and encrypt provider API keys before saving.
+	if d.encKey != nil {
+		config = clonePlanConfig(config)
+		for i := range config.Providers {
+			if config.Providers[i].APIKey != "" {
+				enc, err := encryptValue(d.encKey, config.Providers[i].APIKey)
+				if err != nil {
+					return fmt.Errorf("encrypt api_key for provider %s: %w", config.Providers[i].Name, err)
+				}
+				config.Providers[i].APIKey = enc
+			}
+		}
+	}
+
 	data, err := json.Marshal(config)
 	if err != nil {
 		return fmt.Errorf("marshal plan config: %w", err)
@@ -347,6 +367,15 @@ func (d *DB) SavePlan(slug string, config types.PlanConfig) error {
 	return nil
 }
 
+func clonePlanConfig(config types.PlanConfig) types.PlanConfig {
+	cloned := types.PlanConfig{
+		Strategy:  config.Strategy,
+		Providers: make([]types.ProviderConfig, len(config.Providers)),
+	}
+	copy(cloned.Providers, config.Providers)
+	return cloned
+}
+
 func (d *DB) GetPlan(slug string) (*types.PlanConfig, error) {
 	var configJSON string
 	err := d.conn.QueryRow(`SELECT config FROM plans WHERE slug = ?`, slug).Scan(&configJSON)
@@ -361,6 +390,7 @@ func (d *DB) GetPlan(slug string) (*types.PlanConfig, error) {
 	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
 		return nil, fmt.Errorf("unmarshal plan config: %w", err)
 	}
+	decryptPlanProviders(d.encKey, &config)
 	return &config, nil
 }
 
@@ -382,6 +412,7 @@ func (d *DB) ListPlans() (map[string]types.PlanConfig, error) {
 		if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
 			return nil, fmt.Errorf("unmarshal plan config: %w", err)
 		}
+		decryptPlanProviders(d.encKey, &config)
 		plans[slug] = config
 	}
 
@@ -390,6 +421,23 @@ func (d *DB) ListPlans() (map[string]types.PlanConfig, error) {
 	}
 
 	return plans, nil
+}
+
+func decryptPlanProviders(key []byte, config *types.PlanConfig) {
+	if key == nil {
+		return
+	}
+	for i := range config.Providers {
+		if config.Providers[i].APIKey == "" {
+			continue
+		}
+		decrypted, err := decryptValue(key, config.Providers[i].APIKey)
+		if err != nil {
+			// Leave as-is (legacy plaintext or corrupt); don't break loading
+			continue
+		}
+		config.Providers[i].APIKey = decrypted
+	}
 }
 
 func (d *DB) DeletePlan(slug string) error {
