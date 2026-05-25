@@ -186,8 +186,8 @@ func TestRecordSuccessStat(t *testing.T) {
 	if s.KeyMask != types.MaskAPIKey("sk-test-key") {
 		t.Errorf("key_mask mismatch: got %q, want %q", s.KeyMask, types.MaskAPIKey("sk-test-key"))
 	}
-	if s.ClientKey != "" {
-		t.Errorf("client_key mismatch: got %q, want %q", s.ClientKey, "")
+	if s.ClientKey != "sr-testkey" {
+		t.Errorf("client_key mismatch: got %q, want %q", s.ClientKey, "sr-testkey")
 	}
 	if s.RequestTokens != 10 {
 		t.Errorf("request_tokens mismatch: got %d, want %d", s.RequestTokens, 10)
@@ -434,6 +434,7 @@ func TestHandleStats(t *testing.T) {
 	srv.RegisterRoutes(router)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/stats?limit=10", nil)
+	req.Header.Set("X-Admin-Key", "admin")
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
@@ -463,6 +464,7 @@ func TestHandleStats_FilterByPlan(t *testing.T) {
 	srv.RegisterRoutes(router)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/stats?plan=pro", nil)
+	req.Header.Set("X-Admin-Key", "admin")
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
@@ -1108,6 +1110,7 @@ func TestHandleStatsAggregated(t *testing.T) {
 	srv.RegisterRoutes(router)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/stats/aggregated", nil)
+	req.Header.Set("X-Admin-Key", "admin")
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
@@ -1138,6 +1141,7 @@ func TestHandleStatsAggregated(t *testing.T) {
 
 	// Group by plan
 	req = httptest.NewRequest(http.MethodGet, "/v1/stats/aggregated?group_by=plan", nil)
+	req.Header.Set("X-Admin-Key", "admin")
 	rr = httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
@@ -1681,8 +1685,8 @@ func TestHandleUpdateKey_NotFound(t *testing.T) {
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1708,8 +1712,8 @@ func TestHandleDeleteKey_NotFound(t *testing.T) {
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1801,8 +1805,8 @@ func TestHandleDeleteGroup_NotFound(t *testing.T) {
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1918,6 +1922,7 @@ func TestHandleStats_InvalidLimit(t *testing.T) {
 	_, router := setupTestServer(t, database)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/stats?limit=notanumber", nil)
+	req.Header.Set("X-Admin-Key", "admin")
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
@@ -1965,8 +1970,8 @@ func TestHandleUpdatePlan_NotFound(t *testing.T) {
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -1979,8 +1984,8 @@ func TestHandleDeletePlan_NotFound(t *testing.T) {
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

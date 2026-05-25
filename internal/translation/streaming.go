@@ -16,16 +16,19 @@ func SSETranslator(reader io.Reader, fromFormat, toFormat string) io.Reader {
 	if fromFormat == "anthropic" && toFormat == "openai" {
 		return anthropicToOpenAIStream(reader)
 	}
+	if fromFormat == "openai" && toFormat == "anthropic" {
+		return OpenAIToAnthropicStream(reader)
+	}
 	return reader
 }
 
 // toolCallState tracks an in-progress tool_use block so we can emit OpenAI-style
 // streaming tool_call deltas.
 type toolCallState struct {
-	id        string
-	name      string
-	index     int
-	started   bool // true once we've emitted the id/name chunk
+	id      string
+	name    string
+	index   int
+	started bool // true once we've emitted the id/name chunk
 }
 
 func anthropicToOpenAIStream(reader io.Reader) io.Reader {
@@ -34,6 +37,9 @@ func anthropicToOpenAIStream(reader io.Reader) io.Reader {
 	go func() {
 		defer pw.Close()
 		scanner := bufio.NewScanner(reader)
+		const maxCapacity = 512 * 1024 // 512KB
+		scanBuf := make([]byte, 4096)
+		scanner.Buffer(scanBuf, maxCapacity)
 		var id string
 		var model string
 		roleSent := false
@@ -55,10 +61,6 @@ func anthropicToOpenAIStream(reader io.Reader) io.Reader {
 				continue
 			}
 
-			// Check for ping events (no event: prefix, just data: {})
-			if data == "{}" {
-				continue
-			}
 
 			var event map[string]interface{}
 			if err := json.Unmarshal([]byte(data), &event); err != nil {
@@ -121,7 +123,11 @@ func anthropicToOpenAIStream(reader io.Reader) io.Reader {
 						chunk["choices"].([]map[string]interface{})[0]["delta"].(map[string]interface{})["role"] = "assistant"
 						roleSent = true
 					}
-					b, _ := json.Marshal(chunk)
+					b, err := json.Marshal(chunk)
+					if err != nil {
+						pw.CloseWithError(err)
+						return
+					}
 					if _, err := pw.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
 						pw.CloseWithError(err)
 						return
@@ -165,7 +171,11 @@ func anthropicToOpenAIStream(reader io.Reader) io.Reader {
 						chunk["choices"].([]map[string]interface{})[0]["delta"].(map[string]interface{})["role"] = "assistant"
 						roleSent = true
 					}
-					b, _ := json.Marshal(chunk)
+					b, err := json.Marshal(chunk)
+					if err != nil {
+						pw.CloseWithError(err)
+						return
+					}
 					if _, err := pw.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
 						pw.CloseWithError(err)
 						return
@@ -197,7 +207,11 @@ func anthropicToOpenAIStream(reader io.Reader) io.Reader {
 					roleSent = true
 				}
 
-				b, _ := json.Marshal(chunk)
+				b, err := json.Marshal(chunk)
+				if err != nil {
+					pw.CloseWithError(err)
+					return
+				}
 				if _, err := pw.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
 					pw.CloseWithError(err)
 					return
@@ -229,7 +243,11 @@ func anthropicToOpenAIStream(reader io.Reader) io.Reader {
 					chunk["choices"].([]map[string]interface{})[0]["delta"].(map[string]interface{})["role"] = "assistant"
 					roleSent = true
 				}
-				b, _ := json.Marshal(chunk)
+				b, err := json.Marshal(chunk)
+				if err != nil {
+					pw.CloseWithError(err)
+					return
+				}
 				if _, err := pw.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
 					pw.CloseWithError(err)
 					return
@@ -250,14 +268,50 @@ func anthropicToOpenAIStream(reader io.Reader) io.Reader {
 						{
 							"index": 0,
 							"delta": map[string]interface{}{},
-							"finish_reason": msgDelta["stop_reason"],
+							"finish_reason": mapStopReason(msgDelta["stop_reason"]),
 						},
 					},
 				}
 				if usage != nil {
-					chunk["usage"] = usage
+					translatedUsage := make(map[string]interface{})
+					if v, ok := usage["input_tokens"]; ok {
+						translatedUsage["prompt_tokens"] = v
+					}
+					if v, ok := usage["output_tokens"]; ok {
+						translatedUsage["completion_tokens"] = v
+					}
+					chunk["usage"] = translatedUsage
 				}
-				b, _ := json.Marshal(chunk)
+				b, err := json.Marshal(chunk)
+				if err != nil {
+					pw.CloseWithError(err)
+					return
+				}
+				if _, err := pw.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
+					pw.CloseWithError(err)
+					return
+				}
+
+			case "error":
+				errMsg := "unknown stream error"
+				if errObj, ok := event["error"].(map[string]interface{}); ok {
+					if msg, ok := errObj["message"].(string); ok {
+						errMsg = msg
+					} else if errType, ok := errObj["type"].(string); ok {
+						errMsg = errType
+					}
+				}
+				chunk := map[string]interface{}{
+					"error": map[string]interface{}{
+						"message": errMsg,
+						"type":    "stream_error",
+					},
+				}
+				b, err := json.Marshal(chunk)
+				if err != nil {
+					pw.CloseWithError(err)
+					return
+				}
 				if _, err := pw.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
 					pw.CloseWithError(err)
 					return
@@ -277,6 +331,23 @@ func anthropicToOpenAIStream(reader io.Reader) io.Reader {
 	}()
 
 	return pr
+}
+
+func mapStopReason(v interface{}) interface{} {
+	s, ok := v.(string)
+	if !ok {
+		return v
+	}
+	switch s {
+	case "end_turn":
+		return "stop"
+	case "max_tokens":
+		return "length"
+	case "tool_use":
+		return "tool_calls"
+	default:
+		return v
+	}
 }
 
 // IsStreamingResponse checks if response headers indicate SSE streaming.

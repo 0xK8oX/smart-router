@@ -5,8 +5,36 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
+
+var webhookClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
+var (
+	expiredAlertMu    sync.Mutex
+	expiredAlertCache = make(map[string]time.Time) // key -> last alert time
+	expiredAlertTTL   = 1 * time.Hour
+)
+
+func sendWebhookWithRetry(webhookURL string, body []byte) {
+	const maxRetries = 3
+	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			time.Sleep(time.Duration(i) * time.Second)
+		}
+		resp, err := webhookClient.Post(webhookURL, "application/json", bytes.NewReader(body))
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode < 500 {
+			return
+		}
+	}
+}
 
 // Config holds alert notification configuration from environment variables.
 type Config struct {
@@ -50,30 +78,36 @@ func SendWebhookQuotaAlert(webhookURL, keyName string, usagePercent float64, req
 		"request_count":  reqCount,
 		"timestamp":      time.Now().UTC().Format(time.RFC3339),
 	})
-	go func() {
-		resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(body))
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-	}()
+	go sendWebhookWithRetry(webhookURL, body)
 }
 
 // SendWebhookExpiredAlert POSTs a JSON payload when a key expires.
+// Alerts are deduplicated per key to at most once per hour.
 func SendWebhookExpiredAlert(webhookURL, keyName string) {
 	if webhookURL == "" {
 		return
 	}
+
+	now := time.Now()
+	expiredAlertMu.Lock()
+	// Evict stale entries to prevent unbounded growth.
+	for k, t := range expiredAlertCache {
+		if now.Sub(t) >= expiredAlertTTL {
+			delete(expiredAlertCache, k)
+		}
+	}
+	lastAlert, ok := expiredAlertCache[keyName]
+	if ok && now.Sub(lastAlert) < expiredAlertTTL {
+		expiredAlertMu.Unlock()
+		return
+	}
+	expiredAlertCache[keyName] = now
+	expiredAlertMu.Unlock()
+
 	body, _ := json.Marshal(map[string]interface{}{
 		"event":     "key_expired",
 		"key_name":  keyName,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"timestamp": now.UTC().Format(time.RFC3339),
 	})
-	go func() {
-		resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(body))
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-	}()
+	go sendWebhookWithRetry(webhookURL, body)
 }

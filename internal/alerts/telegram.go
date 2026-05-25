@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -172,10 +173,6 @@ func (b *Bot) cmdPlan(args []string) string {
 	lines = append(lines, fmt.Sprintf("Providers: %d", len(plan.Providers)))
 
 	for _, p := range plan.Providers {
-		mask := p.MaskedKey
-		if mask == "" {
-			mask = p.Name
-		}
 		h, _ := b.health.GetHealth(p.Name)
 		status := h.Status
 		if status == "" {
@@ -203,11 +200,10 @@ func (b *Bot) cmdPlan(args []string) string {
 		if h.ConsecutiveFailures > 0 {
 			lines = append(lines, fmt.Sprintf("    failures=%d reason=%s", h.ConsecutiveFailures, h.LastFailureReason))
 		}
-		if mask != p.Name {
-			usage, _ := b.db.GetWeeklyUsageForPlan(slug, mask)
-			if usage != nil {
-				lines = append(lines, fmt.Sprintf("    weekly: %s req, %s tok", formatNumber(usage.RequestCount), formatNumber(usage.RequestTokens+usage.ResponseTokens)))
-			}
+		keyMask := types.MaskAPIKey(p.APIKey)
+		usage, _ := b.db.GetWeeklyUsageForPlan(slug, keyMask)
+		if usage != nil {
+			lines = append(lines, fmt.Sprintf("    weekly: %s req, %s tok", formatNumber(usage.RequestCount), formatNumber(usage.RequestTokens+usage.ResponseTokens)))
 		}
 	}
 
@@ -571,13 +567,9 @@ func (b *Bot) cmdTop() string {
 	}
 
 	// Sort by requests descending
-	for i := 0; i < len(items)-1; i++ {
-		for j := i + 1; j < len(items); j++ {
-			if items[j].requests > items[i].requests {
-				items[i], items[j] = items[j], items[i]
-			}
-		}
-	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].requests > items[j].requests
+	})
 
 	var lines []string
 	lines = append(lines, "*Top Providers (last 500 records)*")
@@ -725,7 +717,7 @@ func (b *Bot) cmdKey(args []string) string {
 	}
 	lines = append(lines, fmt.Sprintf("Created: %s", time.Unix(k.CreatedAt, 0).Format("2006-01-02")))
 
-	usage, _ := b.db.GetKeyMonthlyUsage(k.Key, time.Now().Year(), int(time.Now().Month()))
+	usage, _ := b.db.GetKeyMonthlyUsage(k.Key, time.Now().UTC().Year(), int(time.Now().UTC().Month()))
 	if usage != nil {
 		lines = append(lines, "")
 		lines = append(lines, fmt.Sprintf("This month: %s req, %s tok", formatNumber(usage.RequestCount), formatNumber(usage.RequestTokens+usage.ResponseTokens)))
@@ -756,8 +748,8 @@ func (b *Bot) cmdKeyUsage(args []string) string {
 	}
 
 	now := time.Now()
-	monthly, _ := b.db.GetKeyMonthlyUsage(k.Key, now.Year(), int(now.Month()))
-	cost, _ := b.db.GetKeyMonthlyCost(k.Key, now.Year(), int(now.Month()))
+	monthly, _ := b.db.GetKeyMonthlyUsage(k.Key, now.UTC().Year(), int(now.UTC().Month()))
+	cost, _ := b.db.GetKeyMonthlyCost(k.Key, now.UTC().Year(), int(now.UTC().Month()))
 
 	var lines []string
 	lines = append(lines, fmt.Sprintf("*%s* — %s", k.Name, label))

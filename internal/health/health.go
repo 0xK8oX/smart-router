@@ -25,12 +25,13 @@ var circuitRules = map[string]struct {
 }
 
 type HealthTracker struct {
-	db    *badger.DB
-	cache map[string]types.ProviderHealth
-	dirty map[string]bool
-	mu    sync.RWMutex
-	stop  chan struct{}
-	wg    sync.WaitGroup
+	db      *badger.DB
+	cache   map[string]types.ProviderHealth
+	dirty   map[string]bool
+	mu      sync.RWMutex
+	stop    chan struct{}
+	wg      sync.WaitGroup
+	closing bool
 }
 
 func New(path string) (*HealthTracker, error) {
@@ -47,14 +48,21 @@ func New(path string) (*HealthTracker, error) {
 		stop:  make(chan struct{}),
 	}
 	h.startFlushWorker()
+	h.startGCWorker()
 	return h, nil
 }
 
 func (h *HealthTracker) Close() error {
+	h.mu.Lock()
+	h.closing = true
+	h.mu.Unlock()
 	close(h.stop)
 	h.wg.Wait()
-	h.flush()
-	return h.db.Close()
+	flushErr := h.flush()
+	if err := h.db.Close(); err != nil {
+		return err
+	}
+	return flushErr
 }
 
 func key(provider string) []byte {
@@ -86,14 +94,24 @@ func (h *HealthTracker) GetHealth(provider string) (types.ProviderHealth, error)
 		return types.ProviderHealth{}, err
 	}
 
-	// Warm cache
+	// Warm cache with double-check to avoid redundant writes.
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if existing, ok := h.cache[provider]; ok {
+		return existing, nil
+	}
 	h.cache[provider] = result
-	h.mu.Unlock()
 	return result, nil
 }
 
 func (h *HealthTracker) RecordFailure(provider string, status int, message string) error {
+	h.mu.RLock()
+	if h.closing {
+		h.mu.RUnlock()
+		return nil
+	}
+	h.mu.RUnlock()
+
 	now := time.Now().Unix()
 	reason := classifyFailure(status, message)
 	rule := circuitRules[reason]
@@ -121,6 +139,13 @@ func (h *HealthTracker) RecordFailure(provider string, status int, message strin
 }
 
 func (h *HealthTracker) RecordSuccess(provider string) error {
+	h.mu.RLock()
+	if h.closing {
+		h.mu.RUnlock()
+		return nil
+	}
+	h.mu.RUnlock()
+
 	now := time.Now().Unix()
 
 	h.mu.Lock()
@@ -128,6 +153,7 @@ func (h *HealthTracker) RecordSuccess(provider string) error {
 	health.Status = "healthy"
 	health.ConsecutiveFailures = 0
 	health.CooldownUntil = 0
+	health.LastFailureReason = ""
 	health.LastSuccessAt = now
 	health.LastActivityAt = now
 	health.SuccessCount++
@@ -162,24 +188,51 @@ func (h *HealthTracker) startFlushWorker() {
 	}()
 }
 
-func (h *HealthTracker) flush() {
+func (h *HealthTracker) startGCWorker() {
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				for {
+					err := h.db.RunValueLogGC(0.5)
+					if err == badger.ErrNoRewrite {
+						break
+					}
+					if err != nil {
+						log.Printf("[HEALTH] value log GC error: %v", err)
+						break
+					}
+				}
+			case <-h.stop:
+				return
+			}
+		}
+	}()
+}
+
+func (h *HealthTracker) flush() error {
 	h.mu.Lock()
 	toFlush := make(map[string]types.ProviderHealth, len(h.dirty))
 	for name := range h.dirty {
 		toFlush[name] = h.cache[name]
 	}
-	h.dirty = make(map[string]bool)
 	h.mu.Unlock()
 
 	if len(toFlush) == 0 {
-		return
+		return nil
 	}
 
+	marshalFailed := make(map[string]bool)
 	if err := h.db.Update(func(txn *badger.Txn) error {
 		for name, health := range toFlush {
 			data, err := json.Marshal(health)
 			if err != nil {
 				log.Printf("[HEALTH] marshal failed for %s: %v", name, err)
+				marshalFailed[name] = true
 				continue
 			}
 			if err := txn.Set(key(name), data); err != nil {
@@ -189,7 +242,25 @@ func (h *HealthTracker) flush() {
 		return nil
 	}); err != nil {
 		log.Printf("[HEALTH] flush failed: %v", err)
+		// Restore dirty markers so un-flushed entries are retried.
+		h.mu.Lock()
+		for name := range toFlush {
+			h.dirty[name] = true
+		}
+		h.mu.Unlock()
+		return err
 	}
+
+	// Only clear dirty after successful flush; preserve dirty for marshal failures
+	// and for entries that were modified during the flush window.
+	h.mu.Lock()
+	for name := range toFlush {
+		if !marshalFailed[name] && h.cache[name] == toFlush[name] {
+			delete(h.dirty, name)
+		}
+	}
+	h.mu.Unlock()
+	return nil
 }
 
 func classifyFailure(status int, message string) string {

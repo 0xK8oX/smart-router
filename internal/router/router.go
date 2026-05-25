@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -61,8 +62,22 @@ func (r *Router) getPlanCached(planSlug string) (*types.PlanConfig, error) {
 	}
 
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if entry, ok := r.planCache[planSlug]; ok && time.Since(entry.loadedAt) < r.cacheTTL {
+		return entry.plan, nil
+	}
 	r.planCache[planSlug] = cachedPlan{plan: plan, loadedAt: time.Now()}
-	r.mu.Unlock()
+	if len(r.planCache) > maxPlanCacheSize {
+		var oldest string
+		var oldestTime time.Time
+		for slug, entry := range r.planCache {
+			if oldest == "" || entry.loadedAt.Before(oldestTime) {
+				oldest = slug
+				oldestTime = entry.loadedAt
+			}
+		}
+		delete(r.planCache, oldest)
+	}
 	return plan, nil
 }
 
@@ -90,6 +105,7 @@ func (r *Router) InvalidateAllPlanCache() {
 // 8. If all fail: return error
 const maxVirtualDepth = 3
 const smartPrefix = "smart://"
+const maxPlanCacheSize = 1000
 
 func isVirtualProvider(baseURL string) bool {
 	return strings.HasPrefix(baseURL, smartPrefix)
@@ -100,8 +116,8 @@ func extractPlanFromURL(baseURL string) string {
 }
 
 // Route finds a healthy provider, calls it, and returns the response.
-func (r *Router) Route(planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, clientKey string) (*http.Response, types.ProviderConfig, error) {
-	return r.routeWithDepth(planSlug, body, isStreaming, clientFormat, headers, 0, clientKey)
+func (r *Router) Route(ctx context.Context, planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, clientKey string) (*http.Response, types.ProviderConfig, error) {
+	return r.routeWithDepth(ctx, planSlug, body, isStreaming, clientFormat, headers, 0, clientKey, nil)
 }
 
 func (r *Router) applyStrategy(planSlug string, strategy string, providers []types.ProviderConfig) []types.ProviderConfig {
@@ -148,25 +164,32 @@ func (r *Router) applyStrategy(planSlug string, strategy string, providers []typ
 		}
 		return append(append([]types.ProviderConfig{}, providers[startIdx:]...), providers[:startIdx]...)
 	case "lru":
-		r.mu.Lock()
+		r.mu.RLock()
 		sorted := make([]types.ProviderConfig, len(providers))
 		copy(sorted, providers)
+		snapshot := make(map[string]time.Time, len(r.lastUsed))
+		for k, v := range r.lastUsed {
+			snapshot[k] = v
+		}
+		r.mu.RUnlock()
 		sort.Slice(sorted, func(i, j int) bool {
-			li := r.lastUsed[sorted[i].Name]
-			lj := r.lastUsed[sorted[j].Name]
+			li := snapshot[sorted[i].Name]
+			lj := snapshot[sorted[j].Name]
 			return li.Before(lj) || li.Equal(lj)
 		})
-		r.mu.Unlock()
 		return sorted
 	default:
 		return providers
 	}
 }
 
-func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, depth int, clientKey string) (*http.Response, types.ProviderConfig, error) {
+func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, depth int, clientKey string, visited map[string]bool) (*http.Response, types.ProviderConfig, error) {
 	plan, err := r.getPlanCached(planSlug)
 	if err != nil {
 		return nil, types.ProviderConfig{}, fmt.Errorf("load plan: %w", err)
+	}
+	if plan == nil {
+		return nil, types.ProviderConfig{}, fmt.Errorf("plan not found: %s", planSlug)
 	}
 
 	requestedModel, _ := body["model"].(string)
@@ -196,7 +219,19 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 				continue
 			}
 			targetPlan := extractPlanFromURL(provider.BaseURL)
-			resp, actualProvider, err := r.routeWithDepth(targetPlan, body, isStreaming, clientFormat, headers, depth+1, clientKey)
+			if visited == nil {
+				visited = make(map[string]bool)
+			}
+			if visited[targetPlan] {
+				providerErrors = append(providerErrors, fmt.Sprintf("%s: virtual provider cycle detected at %s", provider.Name, targetPlan))
+				continue
+			}
+			visitedCopy := make(map[string]bool, len(visited)+1)
+			for k, v := range visited {
+				visitedCopy[k] = v
+			}
+			visitedCopy[targetPlan] = true
+			resp, actualProvider, err := r.routeWithDepth(ctx, targetPlan, body, isStreaming, clientFormat, headers, depth+1, clientKey, visitedCopy)
 			if err != nil {
 				providerErrors = append(providerErrors, fmt.Sprintf("%s: virtual redirect to %s failed: %v", provider.Name, targetPlan, err))
 				continue
@@ -207,8 +242,9 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 		// Check health
 		h, err := r.healthTracker.GetHealth(provider.Name)
 		if err != nil {
-			// If we can't read health, treat as healthy and proceed
-			h = types.ProviderHealth{}
+			log.Printf("[ROUTER] health read error for %s: %v; treating as unhealthy", provider.Name, err)
+			providerErrors = append(providerErrors, fmt.Sprintf("%s: health read error", provider.Name))
+			continue
 		}
 		if h.Status == "unhealthy" && h.CooldownUntil > now {
 			providerErrors = append(providerErrors, fmt.Sprintf("%s: unhealthy (cooldown)", provider.Name))
@@ -232,7 +268,7 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 				Provider:  provider.Name,
 				Model:     provider.Model,
 				KeyMask:   types.MaskAPIKey(provider.APIKey),
-				ClientKey: "",
+				ClientKey: clientKey,
 				Status:    "failure",
 			})
 			providerErrors = append(providerErrors, fmt.Sprintf("%s: translate error", provider.Name))
@@ -245,11 +281,22 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 		var fwdHeaders http.Header
 		if clientFormat == provider.Format {
 			fwdHeaders = headers
+		} else if headers != nil {
+			// Forward tracing headers even when translating formats
+			fwdHeaders = make(http.Header)
+			for _, h := range []string{
+				"X-Request-ID", "X-Trace-ID", "X-Span-ID",
+				"X-Forwarded-For", "X-Real-IP",
+			} {
+				if v := headers.Get(h); v != "" {
+					fwdHeaders.Set(h, v)
+				}
+			}
 		}
 		if isStreaming {
-			resp, err = r.client.CallStream(provider, translatedBody, fwdHeaders)
+			resp, err = r.client.CallStream(ctx, provider, translatedBody, fwdHeaders)
 		} else {
-			resp, err = r.client.Call(provider, translatedBody, fwdHeaders)
+			resp, err = r.client.Call(ctx, provider, translatedBody, fwdHeaders)
 		}
 
 		if err != nil {
@@ -304,5 +351,5 @@ func (r *Router) routeWithDepth(planSlug string, body map[string]interface{}, is
 		providerErrors = append(providerErrors, fmt.Sprintf("%s: HTTP %d %s", provider.Name, resp.StatusCode, errBody))
 	}
 
-	return nil, types.ProviderConfig{}, fmt.Errorf("all providers failed for plan %s", planSlug)
+	return nil, types.ProviderConfig{}, fmt.Errorf("all providers failed for plan %s: %s", planSlug, strings.Join(providerErrors, "; "))
 }

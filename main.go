@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"runtime/debug"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
-	"encoding/base64"
 
 	"smart-router/internal/alerts"
 	"smart-router/internal/api"
@@ -117,15 +121,40 @@ func main() {
 	alerts.StartBot(database, ht)
 
 	muxRouter := mux.NewRouter()
+	// CORS must run before auth so error responses include CORS headers.
+	muxRouter.Use(api.CorsMiddleware)
 	// Auth middleware MUST be applied BEFORE route registration
 	// so that gorilla/mux captures it on every route.
 	muxRouter.Use(authHandler.Middleware)
 	server.RegisterRoutes(muxRouter)
-	handler := loggingMiddleware(muxRouter)
+	handler := loggingMiddleware(recoverMiddleware(muxRouter))
 
 	addr := host + ":" + port
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+	}
+
+	// Graceful shutdown on SIGINT / SIGTERM
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		sig := <-sigCh
+		log.Printf("Received %s, shutting down gracefully...", sig)
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP shutdown error: %v", err)
+		}
+	}()
+
 	log.Printf("Smart Router listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, handler))
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("HTTP server error: %v", err)
+	}
+	log.Printf("Shutdown complete")
 }
 
 func loggingMiddleware(next http.Handler) http.Handler {
@@ -133,5 +162,19 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		start := time.Now()
 		next.ServeHTTP(w, r)
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
+	})
+}
+
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("panic: %v\n%s", rec, debug.Stack())
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":"internal server error"}`))
+			}
+		}()
+		next.ServeHTTP(w, r)
 	})
 }

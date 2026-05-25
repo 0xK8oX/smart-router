@@ -3,6 +3,7 @@ package translation
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -18,12 +19,12 @@ func TestSSETranslator_Passthrough(t *testing.T) {
 	}
 }
 
-func TestSSETranslator_UnsupportedDirection(t *testing.T) {
-	// openai -> anthropic not implemented, should pass through
+func TestSSETranslator_OpenAIToAnthropic(t *testing.T) {
+	// openai -> anthropic is now implemented
 	input := strings.NewReader("data: hello\n\n")
 	out := SSETranslator(input, "openai", "anthropic")
-	if out != input {
-		t.Fatal("expected same reader for unsupported direction")
+	if out == input {
+		t.Fatal("expected a new reader for openai->anthropic")
 	}
 }
 
@@ -316,6 +317,36 @@ data: [DONE]
 	}
 }
 
+func TestAnthropicToOpenAIStream_LargeLine(t *testing.T) {
+	// Build an SSE event with a data line larger than the old 64KB scanner limit
+	largeText := strings.Repeat("A", 100*1024) // 100KB of text
+	event := fmt.Sprintf(`data: {"type":"content_block_delta","index":0,"delta":{"text":"%s"}}`, largeText)
+
+	input := event + "\n\ndata: {\"type\":\"message_stop\"}\n\n"
+
+	out := SSETranslator(strings.NewReader(input), "anthropic", "openai")
+	lines := readAllLines(t, out)
+
+	// Should not error and should produce output lines
+	if len(lines) == 0 {
+		t.Fatal("expected output lines for large SSE event")
+	}
+}
+
+func TestOpenAIToAnthropicStream_LargeLine(t *testing.T) {
+	largeText := strings.Repeat("B", 100*1024) // 100KB of text
+	event := fmt.Sprintf(`data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"content":"%s"}}]}`, largeText)
+
+	input := event + "\n\ndata: [DONE]\n\n"
+
+	out := OpenAIToAnthropicStream(strings.NewReader(input))
+	lines := readAllLines(t, out)
+
+	if len(lines) == 0 {
+		t.Fatal("expected output lines for large SSE event")
+	}
+}
+
 func TestIsStreamingResponse(t *testing.T) {
 	header := http.Header{}
 	header.Set("Content-Type", "text/event-stream")
@@ -334,11 +365,155 @@ func TestIsStreamingResponse(t *testing.T) {
 	}
 }
 
+func TestOpenAIToAnthropicStream_MessageStartWithoutRole(t *testing.T) {
+	// First chunk has content but no role — message_start should still be emitted
+	input := `data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"}}]}
+
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+	out := OpenAIToAnthropicStream(strings.NewReader(input))
+	lines := readAllLines(t, out)
+
+	var foundTypes []string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "event: ") {
+			foundTypes = append(foundTypes, strings.TrimPrefix(line, "event: "))
+		}
+	}
+	if len(foundTypes) < 4 {
+		t.Fatalf("expected at least 4 events, got %d: %v", len(foundTypes), foundTypes)
+	}
+	if foundTypes[0] != "message_start" {
+		t.Errorf("expected first event=message_start, got %q", foundTypes[0])
+	}
+	if foundTypes[1] != "content_block_start" {
+		t.Errorf("expected content_block_start, got %q", foundTypes[1])
+	}
+	if foundTypes[2] != "content_block_delta" {
+		t.Errorf("expected content_block_delta, got %q", foundTypes[2])
+	}
+	if foundTypes[len(foundTypes)-1] != "message_stop" {
+		t.Errorf("expected last event=message_stop, got %q", foundTypes[len(foundTypes)-1])
+	}
+}
+
+func TestOpenAIToAnthropicStream_ToolCallContentBlockStop(t *testing.T) {
+	input := `data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_123","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}
+
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"loc"}}]}}]}
+
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ation\":\"NYC\"}"}}]}}]}
+
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+`
+
+	out := OpenAIToAnthropicStream(strings.NewReader(input))
+	lines := readAllLines(t, out)
+
+	var foundTypes []string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "event: ") {
+			foundTypes = append(foundTypes, strings.TrimPrefix(line, "event: "))
+		}
+	}
+
+	// Should have: message_start, content_block_start, content_block_delta, content_block_delta, content_block_stop, message_delta, message_stop
+	if len(foundTypes) < 7 {
+		t.Fatalf("expected at least 7 events, got %d: %v", len(foundTypes), foundTypes)
+	}
+
+	// Check content_block_stop appears before message_delta
+	stopIdx := -1
+	deltaIdx := -1
+	for i, et := range foundTypes {
+		if et == "content_block_stop" {
+			stopIdx = i
+		}
+		if et == "message_delta" {
+			deltaIdx = i
+		}
+	}
+	if stopIdx == -1 {
+		t.Fatal("expected content_block_stop in output")
+	}
+	if deltaIdx == -1 {
+		t.Fatal("expected message_delta in output")
+	}
+	if stopIdx >= deltaIdx {
+		t.Fatalf("expected content_block_stop before message_delta, got stopIdx=%d deltaIdx=%d", stopIdx, deltaIdx)
+	}
+}
+
+func TestOpenAIToAnthropicStream_TextContentBlockStart(t *testing.T) {
+	input := `data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}
+
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"content":" world"}}]}
+
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+	out := OpenAIToAnthropicStream(strings.NewReader(input))
+	lines := readAllLines(t, out)
+
+	var foundTypes []string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "event: ") {
+			foundTypes = append(foundTypes, strings.TrimPrefix(line, "event: "))
+		}
+	}
+	if len(foundTypes) < 5 {
+		t.Fatalf("expected at least 5 events, got %d: %v", len(foundTypes), foundTypes)
+	}
+	if foundTypes[1] != "content_block_start" {
+		t.Errorf("expected content_block_start as second event, got %q", foundTypes[1])
+	}
+}
+
+func TestOpenAIToAnthropicStream_FunctionCallFinishReason(t *testing.T) {
+	input := `data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant"}}]}
+
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"content":""},"finish_reason":"function_call"}]}
+
+data: [DONE]
+
+`
+	out := OpenAIToAnthropicStream(strings.NewReader(input))
+	lines := readAllLines(t, out)
+
+	var foundStopReason string
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		event := parseDataLine(t, line)
+		if event["type"] == "message_delta" {
+			delta, _ := event["delta"].(map[string]interface{})
+			if sr, ok := delta["stop_reason"].(string); ok {
+				foundStopReason = sr
+			}
+		}
+	}
+	if foundStopReason != "tool_use" {
+		t.Errorf("expected stop_reason=tool_use for function_call finish, got %q", foundStopReason)
+	}
+}
+
 // Helpers
 
 func readAllLines(t *testing.T, r io.Reader) []string {
 	t.Helper()
 	scanner := bufio.NewScanner(r)
+	const maxCapacity = 512 * 1024
+	scanBuf := make([]byte, 4096)
+	scanner.Buffer(scanBuf, maxCapacity)
 	var lines []string
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())

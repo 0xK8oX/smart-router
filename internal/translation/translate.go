@@ -16,14 +16,14 @@ func TranslateRequest(body map[string]interface{}, sourceFormat, targetFormat st
 		return nil, fmt.Errorf("body is nil")
 	}
 
-	if sourceFormat == targetFormat {
-		return body, nil
-	}
-
 	// Create a shallow copy so we don't mutate the caller's map.
 	result := make(map[string]interface{}, len(body))
 	for k, v := range body {
 		result[k] = v
+	}
+
+	if sourceFormat == targetFormat {
+		return result, nil
 	}
 
 	if sourceFormat == "openai" && targetFormat == "anthropic" {
@@ -293,19 +293,31 @@ func convertOpenAIContentBlocks(blocks []interface{}) []interface{} {
 			} else if obj, ok := block["image_url"].(map[string]interface{}); ok {
 				url, _ = obj["url"].(string)
 			}
-			mediaType := "image/png"
-			if m := dataURIMediaType.FindStringSubmatch(url); len(m) > 1 {
-				mediaType = m[1]
+			// Only convert data URIs to Anthropic base64 image blocks.
+			// Pass through regular HTTP URLs as-is (downstream may support them).
+			if strings.HasPrefix(url, "data:") {
+				mediaType := "image/png"
+				if m := dataURIMediaType.FindStringSubmatch(url); len(m) > 1 {
+					mediaType = m[1]
+				}
+				prefix := "data:" + mediaType + ";base64,"
+				if !strings.HasPrefix(url, prefix) {
+					// Malformed data URI — fall back to passing through as text.
+					result = append(result, block)
+				} else {
+					data := strings.TrimPrefix(url, prefix)
+					result = append(result, map[string]interface{}{
+						"type": "image",
+						"source": map[string]interface{}{
+							"type":       "base64",
+							"media_type": mediaType,
+							"data":       data,
+						},
+					})
+				}
+			} else {
+				result = append(result, block)
 			}
-			data := strings.TrimPrefix(url, "data:"+mediaType+";base64,")
-			result = append(result, map[string]interface{}{
-				"type": "image",
-				"source": map[string]interface{}{
-					"type":       "base64",
-					"media_type": mediaType,
-					"data":       data,
-				},
-			})
 		case "text":
 			text, _ := block["text"].(string)
 			result = append(result, map[string]interface{}{
@@ -353,11 +365,12 @@ func translateAnthropicToOpenAI(data []byte) ([]byte, error) {
 		Model      string `json:"model"`
 		StopReason string `json:"stop_reason"`
 		Content    []struct {
-			Type   string          `json:"type"`
-			Text   string          `json:"text"`
-			ID     string          `json:"id"`
-			Name   string          `json:"name"`
-			Input  json.RawMessage `json:"input"`
+			Type     string          `json:"type"`
+			Text     string          `json:"text"`
+			Thinking string          `json:"thinking"`
+			ID       string          `json:"id"`
+			Name     string          `json:"name"`
+			Input    json.RawMessage `json:"input"`
 			Source struct {
 				Type       string `json:"type"`
 				MediaType  string `json:"media_type"`
@@ -405,6 +418,9 @@ func translateAnthropicToOpenAI(data []byte) ([]byte, error) {
 					"arguments": args,
 				},
 			})
+		case "thinking":
+			// Map thinking blocks to OpenAI reasoning field.
+			content.WriteString(c.Text)
 		case "image":
 			imageURLs = append(imageURLs, map[string]interface{}{
 				"type": "image_url",
@@ -423,8 +439,6 @@ func translateAnthropicToOpenAI(data []byte) ([]byte, error) {
 		finishReason = "length"
 	case "tool_use":
 		finishReason = "tool_calls"
-	case "":
-		finishReason = "stop"
 	}
 
 	contentStr := content.String()
@@ -538,6 +552,8 @@ func translateOpenAIToAnthropic(data []byte) ([]byte, error) {
 			stopReason = "max_tokens"
 		case "tool_calls":
 			stopReason = "tool_use"
+		case "stop":
+			stopReason = "end_turn"
 		case "":
 			stopReason = "end_turn"
 		default:

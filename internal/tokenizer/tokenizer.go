@@ -2,26 +2,38 @@ package tokenizer
 
 import (
 	"encoding/json"
+	"sync"
 
 	"github.com/pkoukk/tiktoken-go"
 )
 
-var enc *tiktoken.Tiktoken
+var (
+	encOnce sync.Once
+	enc     *tiktoken.Tiktoken
+	encErr  error
+)
 
-func init() {
-	var err error
-	enc, err = tiktoken.GetEncoding("cl100k_base")
-	if err != nil {
-		panic("failed to load tiktoken encoding: " + err.Error())
+func getEncoder() *tiktoken.Tiktoken {
+	encOnce.Do(func() {
+		enc, encErr = tiktoken.GetEncoding("cl100k_base")
+	})
+	if encErr != nil {
+		return nil
 	}
+	return enc
 }
 
 // CountString returns the tiktoken count for a single string.
+// Falls back to a rough character estimate if tiktoken fails to load.
 func CountString(text string) int {
 	if text == "" {
 		return 0
 	}
-	return len(enc.Encode(text, nil, nil))
+	e := getEncoder()
+	if e == nil {
+		return len(text) / 4
+	}
+	return len(e.Encode(text, nil, nil))
 }
 
 // CountMessages counts tokens in a messages array (OpenAI or Anthropic format).

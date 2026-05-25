@@ -1246,15 +1246,10 @@ data: [DONE]
 `
 		out := OpenAIToAnthropicStream(strings.NewReader(input))
 		lines := readAllLines(t, out)
-		var foundStop bool
-		for _, line := range lines {
-			if strings.TrimSpace(line) == "event: message_stop" {
-				foundStop = true
-				break
-			}
-		}
-		if !foundStop {
-			t.Fatalf("expected message_stop event, got lines: %v", lines)
+		// No valid chunks were received, so no message_start was emitted;
+		// message_stop should not be sent without a preceding message_start.
+		if len(lines) != 0 {
+			t.Fatalf("expected no events for empty stream, got lines: %v", lines)
 		}
 	})
 }

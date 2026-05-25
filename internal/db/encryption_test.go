@@ -1,6 +1,7 @@
 package db
 
 import (
+	"strings"
 	"testing"
 
 	"smart-router/internal/types"
@@ -133,5 +134,38 @@ func TestGetPlanLegacyPlaintext(t *testing.T) {
 	}
 	if loaded.Providers[0].APIKey != "sk-plaintext" {
 		t.Fatalf("expected legacy plaintext, got %q", loaded.Providers[0].APIKey)
+	}
+}
+
+func TestSavePlanWithEmptyEncKeyStoresPlaintext(t *testing.T) {
+	tmp := t.TempDir() + "/test.db"
+	database, err := Open(tmp)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	// Set an empty (non-nil) encryption key
+	database.WithEncryptionKey([]byte{})
+
+	plan := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "openai", APIKey: "sk-should-be-plain"},
+		},
+	}
+	if err := database.SavePlan("empty-key", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	// Load back and verify the key is still plaintext (not prefixed with "enc:")
+	loaded, err := database.GetPlan("empty-key")
+	if err != nil {
+		t.Fatalf("get plan: %v", err)
+	}
+	if loaded.Providers[0].APIKey != "sk-should-be-plain" {
+		t.Fatalf("expected plaintext api key, got %q", loaded.Providers[0].APIKey)
+	}
+	if strings.HasPrefix(loaded.Providers[0].APIKey, "enc:") {
+		t.Fatal("api key should not be encrypted with empty enc key")
 	}
 }

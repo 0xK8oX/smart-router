@@ -1043,6 +1043,44 @@ func TestMiddleware_OPTIONSSkipAuth(t *testing.T) {
 	}
 }
 
+func TestMiddleware_BodyPassedThroughContext(t *testing.T) {
+	db := setupTestDB(t)
+	rl := auth.NewRateLimiter()
+	a := NewAuth(db, rl)
+	_ = db.SavePlan("default", types.PlanConfig{Providers: []types.ProviderConfig{{Name: "test", Model: "gpt-4"}}})
+
+	key := types.APIKey{Key: "sr-body-ctx", Name: "body-ctx", Plans: []string{"default"}, CreatedAt: time.Now().Unix()}
+	if err := db.CreateAPIKey(key); err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+
+	var capturedBody map[string]interface{}
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedBody, _ = BodyFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	reqBody := `{"model":"gpt-4","messages":[{"role":"user","content":"hello"}],"temperature":0.7}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Authorization", "Bearer "+key.Key)
+	rr := httptest.NewRecorder()
+	a.Middleware(next).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	if capturedBody == nil {
+		t.Fatal("expected body in context, got nil")
+	}
+	if capturedBody["model"] != "gpt-4" {
+		t.Errorf("expected model=gpt-4 in context body, got %v", capturedBody["model"])
+	}
+	if temp, ok := capturedBody["temperature"].(float64); !ok || temp != 0.7 {
+		t.Errorf("expected temperature=0.7 in context body, got %v", capturedBody["temperature"])
+	}
+}
+
 func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }

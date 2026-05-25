@@ -418,29 +418,29 @@ func TestGetKeyMonthlyCost_WithPricing(t *testing.T) {
 
 func TestDeleteAPIKey_NotFound(t *testing.T) {
 	db := setupTestDB(t)
-	if err := db.DeleteAPIKey("nonexistent"); err != nil {
-		t.Fatalf("expected no error for deleting nonexistent key, got %v", err)
+	if err := db.DeleteAPIKey("nonexistent"); err == nil {
+		t.Fatal("expected error for deleting nonexistent key")
 	}
 }
 
 func TestUpdateAPIKey_NotFound(t *testing.T) {
 	db := setupTestDB(t)
-	if err := db.UpdateAPIKey("nonexistent", types.APIKey{Name: "x"}); err != nil {
-		t.Fatalf("expected no error for updating nonexistent key, got %v", err)
+	if err := db.UpdateAPIKey("nonexistent", types.APIKey{Name: "x"}); err == nil {
+		t.Fatal("expected error for updating nonexistent key")
 	}
 }
 
 func TestDeleteKeyGroup_NotFound(t *testing.T) {
 	db := setupTestDB(t)
-	if err := db.DeleteKeyGroup(99999); err != nil {
-		t.Fatalf("expected no error for deleting nonexistent group, got %v", err)
+	if err := db.DeleteKeyGroup(99999); err == nil {
+		t.Fatal("expected error for deleting nonexistent group")
 	}
 }
 
 func TestUpdateKeyGroup_NotFound(t *testing.T) {
 	db := setupTestDB(t)
-	if err := db.UpdateKeyGroup(99999, types.KeyGroup{Name: "x"}); err != nil {
-		t.Fatalf("expected no error for updating nonexistent group, got %v", err)
+	if err := db.UpdateKeyGroup(99999, types.KeyGroup{Name: "x"}); err == nil {
+		t.Fatal("expected error for updating nonexistent group")
 	}
 }
 

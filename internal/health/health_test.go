@@ -173,4 +173,7 @@ func TestRecordSuccessResets(t *testing.T) {
 	if h.TotalRequests != 2 {
 		t.Errorf("expected totalRequests 2, got %d", h.TotalRequests)
 	}
+	if h.LastFailureReason != "" {
+		t.Errorf("expected LastFailureReason cleared, got %q", h.LastFailureReason)
+	}
 }

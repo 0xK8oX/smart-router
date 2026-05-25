@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"io"
@@ -47,10 +48,6 @@ func NewServer(r *router.Router, h *health.HealthTracker, d *db.DB, a *Auth, adm
 }
 
 func (s *Server) RegisterRoutes(r *mux.Router) {
-	// CORS middleware must be applied BEFORE route registration
-	// so that routes capture it.
-	r.Use(corsMiddleware)
-
 	r.HandleFunc("/v1/chat/completions", s.handleChatCompletions).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/messages", s.handleMessages).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/models", s.handleListModels).Methods(http.MethodGet, http.MethodOptions)
@@ -88,11 +85,11 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	})
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
+func CorsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key, Authorization, x-api-key")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -101,8 +98,21 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// isSensitiveHeader returns true for headers that must not be forwarded from
+// upstream responses to clients.
+func isSensitiveHeader(name string) bool {
+	lower := strings.ToLower(name)
+	switch lower {
+	case "authorization", "x-api-key", "set-cookie", "cookie",
+		"proxy-authenticate", "proxy-authorization":
+		return true
+	}
+	return false
+}
+
 func maskPlan(plan types.PlanConfig) types.PlanConfig {
 	masked := types.PlanConfig{
+		Strategy:  plan.Strategy,
 		Providers: make([]types.ProviderConfig, len(plan.Providers)),
 	}
 	for i, p := range plan.Providers {
@@ -219,6 +229,12 @@ func countStreamOutput(data []byte, format string) int {
 				if text, ok := delta["text"].(string); ok {
 					content.WriteString(text)
 				}
+				if thinking, ok := delta["thinking"].(string); ok {
+					content.WriteString(thinking)
+				}
+				if partial, ok := delta["partial_json"].(string); ok {
+					content.WriteString(partial)
+				}
 			}
 		default:
 			if choices, ok := eventJSON["choices"].([]interface{}); ok && len(choices) > 0 {
@@ -226,6 +242,20 @@ func countStreamOutput(data []byte, format string) int {
 					if delta, ok := choice["delta"].(map[string]interface{}); ok {
 						if text, ok := delta["content"].(string); ok {
 							content.WriteString(text)
+						}
+						if reasoning, ok := delta["reasoning"].(string); ok {
+							content.WriteString(reasoning)
+						}
+						if tcs, ok := delta["tool_calls"].([]interface{}); ok {
+							for _, tc := range tcs {
+								if tcMap, ok := tc.(map[string]interface{}); ok {
+									if fn, ok := tcMap["function"].(map[string]interface{}); ok {
+										if args, ok := fn["arguments"].(string); ok {
+											content.WriteString(args)
+										}
+									}
+								}
+							}
 						}
 					}
 				}
@@ -244,6 +274,9 @@ func fallbackCount(reqBody map[string]interface{}, respData []byte, format strin
 				messages = append(messages, msg)
 			}
 		}
+	}
+	if messages == nil {
+		messages = []map[string]interface{}{}
 	}
 	reqTokens = tokenizer.CountMessages(messages)
 
@@ -270,7 +303,7 @@ func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig
 		Provider:       provider.Name,
 		Model:          provider.Model,
 		KeyMask:        types.MaskAPIKey(provider.APIKey),
-		ClientKey:      "",
+		ClientKey:      clientKey,
 		RequestTokens:  reqTokens,
 		ResponseTokens: respTokens,
 		TotalTokens:    reqTokens + respTokens,
@@ -292,6 +325,40 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
+// emitStreamError writes an SSE error event in the client's expected format.
+func emitStreamError(w http.ResponseWriter, flusher http.Flusher, clientFormat string, err error) {
+	var payload []byte
+	var marshalErr error
+	switch clientFormat {
+	case "anthropic":
+		payload, marshalErr = json.Marshal(map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"type":    "stream_error",
+				"message": err.Error(),
+			},
+		})
+	default:
+		payload, marshalErr = json.Marshal(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": err.Error(),
+				"type":    "stream_error",
+			},
+		})
+	}
+	if marshalErr != nil {
+		return
+	}
+	if clientFormat == "anthropic" {
+		w.Write([]byte("event: error\ndata: " + string(payload) + "\n\n"))
+	} else {
+		w.Write([]byte("data: " + string(payload) + "\n\n"))
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
 var streamBufPool = sync.Pool{
 	New: func() interface{} {
 		b := make([]byte, 4096)
@@ -299,58 +366,96 @@ var streamBufPool = sync.Pool{
 	},
 }
 
-func (s *Server) proxyStream(w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string, clientKey string, reqBody map[string]interface{}) {
+func (s *Server) proxyStream(ctx context.Context, w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string, clientKey string, reqBody map[string]interface{}) {
+	if closer, ok := bodyReader.(io.Closer); ok {
+		defer closer.Close()
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Printf("streaming: ResponseWriter does not support flushing")
 	}
-	const maxCapture = 32 * 1024
+	const maxCapture = 256 * 1024
 	var captured []byte
 	bufPtr := streamBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer streamBufPool.Put(bufPtr)
-	for {
-		n, err := bodyReader.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
+	recordStat := func(status string) {
+		latencyMs := time.Since(start).Milliseconds()
+		reqTokens, respTokens := extractUsageFromStream(captured, clientFormat)
+		if !isSaneUsage(reqTokens, respTokens) {
+			reqTokens, respTokens = fallbackCount(reqBody, captured, clientFormat, true)
+		}
+		s.db.RecordStatAsync(types.StatRecord{
+			Plan:           planSlug,
+			Provider:       provider.Name,
+			Model:          provider.Model,
+			KeyMask:        types.MaskAPIKey(provider.APIKey),
+			ClientKey:      clientKey,
+			RequestTokens:  reqTokens,
+			ResponseTokens: respTokens,
+			TotalTokens:    reqTokens + respTokens,
+			Status:         status,
+			LatencyMs:      latencyMs,
+			IsStreaming:    true,
+		})
+	}
+
+	type readResult struct {
+		n   int
+		err error
+	}
+	readCh := make(chan readResult, 1)
+	go func() {
+		for {
+			n, err := bodyReader.Read(buf)
+			select {
+			case readCh <- readResult{n: n, err: err}:
+			case <-ctx.Done():
 				return
 			}
-			if ok {
-				flusher.Flush()
-			}
-			captured = append(captured, buf[:n]...)
-			if len(captured) > maxCapture {
-				captured = captured[len(captured)-maxCapture:]
+			if err != nil {
+				return
 			}
 		}
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("streaming read error: %v", err)
-			}
-			latencyMs := time.Since(start).Milliseconds()
-			reqTokens, respTokens := extractUsageFromStream(captured, clientFormat)
-			if !isSaneUsage(reqTokens, respTokens) {
-				reqTokens, respTokens = fallbackCount(reqBody, captured, clientFormat, true)
-			}
-			s.db.RecordStatAsync(types.StatRecord{
-				Plan:           planSlug,
-				Provider:       provider.Name,
-				Model:          provider.Model,
-				KeyMask:        types.MaskAPIKey(provider.APIKey),
-				ClientKey:      "",
-				RequestTokens:  reqTokens,
-				ResponseTokens: respTokens,
-				TotalTokens:    reqTokens + respTokens,
-				Status:         "success",
-				LatencyMs:      latencyMs,
-				IsStreaming:    true,
-			})
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			recordStat("failure")
 			return
+		case result := <-readCh:
+			if result.n > 0 {
+				if _, werr := w.Write(buf[:result.n]); werr != nil {
+					recordStat("failure")
+					return
+				}
+				if ok {
+					flusher.Flush()
+				}
+				captured = append(captured, buf[:result.n]...)
+				if len(captured) > maxCapture {
+					captured = captured[len(captured)-maxCapture:]
+				}
+			}
+			if result.err != nil {
+				status := "success"
+				if result.err != io.EOF {
+					status = "failure"
+					log.Printf("streaming read error: %v", result.err)
+					emitStreamError(w, flusher, clientFormat, result.err)
+				}
+				recordStat(status)
+				return
+			}
 		}
 	}
 }
 
-const maxRequestBodySize = 10 * 1024 * 1024 // 10MB
+const (
+	maxRequestBodySize  = 10 * 1024 * 1024  // 10MB
+	maxResponseBodySize = 50 * 1024 * 1024  // 50MB
+)
 
 func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, clientFormat string) {
 	start := time.Now()
@@ -415,21 +520,24 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 		}
 	}
 
-	resp, provider, err := s.router.Route(planSlug, body, isStreaming, clientFormat, r.Header, clientKey)
+	resp, provider, err := s.router.Route(r.Context(), planSlug, body, isStreaming, clientFormat, r.Header, clientKey)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers
+	// Copy response headers, filtering out sensitive ones from upstream.
 	for k, vv := range resp.Header {
+		if isSensitiveHeader(k) {
+			continue
+		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
 
-	if isStreaming {
+	if isStreaming && resp.StatusCode >= 200 && resp.StatusCode < 300 && translation.IsStreamingResponse(resp.Header) {
 		w.Header().Del("Content-Length")
 		w.Header().Del("Content-Encoding")
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
@@ -440,23 +548,32 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 		if provider.Format != clientFormat {
 			bodyReader = translation.SSETranslator(resp.Body, provider.Format, clientFormat)
 		}
-		s.proxyStream(w, bodyReader, planSlug, provider, start, clientFormat, clientKey, body)
+		s.proxyStream(r.Context(), w, bodyReader, planSlug, provider, start, clientFormat, clientKey, body)
 		return
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize+1))
 	if err != nil {
 		log.Printf("read response body error: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to read response")
 		return
 	}
+	if int64(len(data)) > maxResponseBodySize {
+		writeError(w, http.StatusInternalServerError, "response body too large")
+		return
+	}
 
 	if provider.Format != clientFormat {
-		data, err = translation.TranslateResponse(data, provider.Format, clientFormat)
+		translated, err := translation.TranslateResponse(data, provider.Format, clientFormat)
 		if err != nil {
 			log.Printf("translate response error: %v", err)
+		} else {
+			data = translated
 		}
 	}
+
+	// Translation changes body size; remove upstream Content-Length to avoid truncation.
+	w.Header().Del("Content-Length")
 
 	latencyMs := time.Since(start).Milliseconds()
 	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat, clientKey, body)
@@ -575,6 +692,10 @@ func (s *Server) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {
 	var plan types.PlanConfig
 	if err := json.NewDecoder(r.Body).Decode(&plan); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if _, err := s.db.GetPlan(slug); err != nil {
+		writeError(w, http.StatusNotFound, "plan not found")
 		return
 	}
 
@@ -719,6 +840,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	if !s.requireAdmin(w, r) {
+		return
+	}
 
 	plan := r.URL.Query().Get("plan")
 	provider := r.URL.Query().Get("provider")
@@ -742,6 +866,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStatsAggregated(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !s.requireAdmin(w, r) {
 		return
 	}
 
@@ -817,6 +944,9 @@ func SeedPlansFromFile(database *db.DB, path string) error {
 }
 
 func adminKeyValid(provided, expected string) bool {
+	if expected == "" || provided == "" {
+		return false
+	}
 	if len(provided) != len(expected) {
 		return false
 	}
@@ -908,14 +1038,35 @@ func (s *Server) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := mux.Vars(r)["key"]
-	var updates types.APIKey
-	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read body")
+		return
+	}
+	if !json.Valid(bodyBytes) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if err := s.db.UpdateAPIKey(key, updates); err != nil {
+	existing, err := s.db.GetAPIKey(key)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "key not found")
+		return
+	}
+	var k types.APIKey
+	if err := json.Unmarshal(bodyBytes, &k); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	// Preserve the original key identifier and server-managed timestamps.
+	k.Key = key
+	k.CreatedAt = existing.CreatedAt
+	k.LastUsedAt = existing.LastUsedAt
+	if err := s.db.UpdateAPIKey(key, k); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if s.auth != nil {
+		s.auth.InvalidateKeyCache(key)
 	}
 	_ = s.db.RecordAudit("key_updated", key, r.Header.Get("X-Admin-Key"), "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -934,6 +1085,9 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if s.auth != nil {
+		s.auth.InvalidateKeyCache(key)
+	}
 	_ = s.db.RecordAudit("key_deleted", key, r.Header.Get("X-Admin-Key"), "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -947,7 +1101,7 @@ func (s *Server) handleKeyUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := mux.Vars(r)["key"]
-	now := time.Now()
+	now := time.Now().UTC()
 	monthly, err := s.db.GetKeyMonthlyUsage(key, now.Year(), int(now.Month()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1080,7 +1234,7 @@ func (s *Server) handleGetGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	now := time.Now()
+	now := time.Now().UTC()
 	usage, _ := s.db.GetGroupMonthlyUsage(id, now.Year(), int(now.Month()))
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"group": g,
@@ -1102,14 +1256,30 @@ func (s *Server) handleUpdateGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid group id")
 		return
 	}
-	var updates types.KeyGroup
-	if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read body")
+		return
+	}
+	if !json.Valid(bodyBytes) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if err := s.db.UpdateKeyGroup(id, updates); err != nil {
+	g, err := s.db.GetKeyGroup(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err := json.Unmarshal(bodyBytes, g); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := s.db.UpdateKeyGroup(id, *g); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if s.auth != nil {
+		s.auth.InvalidateGroupCache(id)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -1131,6 +1301,9 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.DeleteKeyGroup(id); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if s.auth != nil {
+		s.auth.InvalidateGroupCache(id)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

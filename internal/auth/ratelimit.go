@@ -37,9 +37,13 @@ func (rl *RateLimiter) Allow(key string, rpmLimit, rpdLimit int) (bool, string) 
 	w, ok := rl.windows[key]
 	rl.mu.RUnlock()
 	if !ok {
-		w = &window{}
 		rl.mu.Lock()
-		rl.windows[key] = w
+		if w2, ok2 := rl.windows[key]; ok2 {
+			w = w2
+		} else {
+			w = &window{}
+			rl.windows[key] = w
+		}
 		rl.mu.Unlock()
 	}
 
@@ -91,15 +95,25 @@ func (rl *RateLimiter) cleanup() {
 		rl.mu.Lock()
 		for k, w := range rl.windows {
 			w.mu.Lock()
-			var active []int64
+			var activeRPD []int64
 			for _, ts := range w.rpd {
 				if ts > cutoff {
-					active = append(active, ts)
+					activeRPD = append(activeRPD, ts)
 				}
 			}
-			w.rpd = active
-			w.rpm = nil // rpm is always < 60s old, so purge entirely
-			if len(w.rpd) == 0 {
+			w.rpd = activeRPD
+
+			cutoffRPM := time.Now().Unix() - 60
+			var activeRPM []int64
+			for _, ts := range w.rpm {
+				if ts > cutoffRPM {
+					activeRPM = append(activeRPM, ts)
+				}
+			}
+			w.rpm = activeRPM
+
+			// Delete windows with no active entries to prevent unbounded growth.
+			if len(w.rpm) == 0 && len(w.rpd) == 0 {
 				delete(rl.windows, k)
 			}
 			w.mu.Unlock()

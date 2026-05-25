@@ -25,6 +25,7 @@ const (
 	clientKeyContextKey contextKey = iota
 	apiKeyContextKey
 	planSlugContextKey
+	bodyContextKey
 )
 
 // resolvePlanFromBody extracts the plan slug from the request body model field.
@@ -37,6 +38,9 @@ func resolvePlanFromBody(body map[string]interface{}) string {
 		} else if idx := strings.Index(model, "/"); idx > 0 {
 			planSlug = model[:idx]
 		}
+	}
+	if planSlug == "" {
+		planSlug = "default"
 	}
 	return planSlug
 }
@@ -58,6 +62,9 @@ type Auth struct {
 	lastUsedMu    sync.Mutex
 	alertedKeys   map[string]bool // key="key:YYYY-MM" tracks 80% quota alerts sent this month
 	alertedMu     sync.Mutex
+	stop          chan struct{}
+	closeOnce     sync.Once
+	wg            sync.WaitGroup
 }
 
 type cachedKey struct {
@@ -88,10 +95,21 @@ func NewAuth(database *db.DB, rateLimiter *auth.RateLimiter) *Auth {
 		groupCacheTTL: 60 * time.Second,
 		lastUsedBatch: make(map[string]struct{}),
 		alertedKeys:   make(map[string]bool),
+		stop:          make(chan struct{}),
 	}
+	a.wg.Add(1)
 	go a.cacheEvictionWorker()
+	a.wg.Add(1)
 	go a.lastUsedFlushWorker()
 	return a
+}
+
+// Close stops the background workers and waits for them to finish.
+func (a *Auth) Close() {
+	a.closeOnce.Do(func() {
+		close(a.stop)
+		a.wg.Wait()
+	})
 }
 
 // Middleware returns an HTTP middleware that validates API keys.
@@ -103,10 +121,13 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Skip auth for admin endpoints (they use X-Admin-Key)
-		if strings.HasPrefix(r.URL.Path, "/v1/plans") ||
+		// Skip auth for public and admin endpoints
+		if strings.HasPrefix(r.URL.Path, "/v1/models") ||
+			strings.HasPrefix(r.URL.Path, "/v1/health") ||
+			strings.HasPrefix(r.URL.Path, "/v1/plans") ||
 			strings.HasPrefix(r.URL.Path, "/v1/keys") ||
 			strings.HasPrefix(r.URL.Path, "/v1/audit") ||
+			strings.HasPrefix(r.URL.Path, "/v1/groups") ||
 			r.URL.Path == "/v1/stats" ||
 			r.URL.Path == "/v1/stats/aggregated" {
 			next.ServeHTTP(w, r)
@@ -152,36 +173,14 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 			}
 		}
 
-		// Extract requested plan from body (supports auto-<plan> and plan/model syntax)
-		bodyBytes, _ := io.ReadAll(r.Body)
-		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		var body map[string]interface{}
-		_ = json.Unmarshal(bodyBytes, &body)
-		planSlug := resolvePlanFromBody(body)
-
-		// Plan access check
-		if len(apiKey.Plans) > 0 {
-			allowed := false
-			for _, p := range apiKey.Plans {
-				if p == planSlug || p == "*" {
-					allowed = true
-					break
-				}
-			}
-			if !allowed {
-				writeError(w, http.StatusForbidden, "plan not allowed for this key")
-				return
-			}
-		}
-
-		// Rate limit check
+		// Rate limit check — before body read so rejected requests pay no I/O cost
 		if ok, reason := a.rl.Allow(token, apiKey.RateLimitRPM, apiKey.RateLimitRPD); !ok {
 			writeError(w, http.StatusTooManyRequests, fmt.Sprintf("rate limit exceeded: %s", reason))
 			return
 		}
 
-		// Monthly quota checks
-		now := time.Now()
+		// Monthly quota checks — before body read
+		now := time.Now().UTC()
 		if apiKey.MonthlyTokenLimit > 0 || apiKey.MonthlyRequestLimit > 0 {
 			usage, err := a.getUsageCached(token, now.Year(), int(now.Month()))
 			if err != nil {
@@ -201,11 +200,11 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 			a.checkAndSendQuotaAlert(apiKey, usage)
 		}
 
-		// Group quota checks
+		// Group quota checks — before body read
 		if apiKey.GroupID != nil {
 			group, err := a.getGroupCached(*apiKey.GroupID)
 			if err == nil && (group.MonthlyTokenLimit > 0 || group.MonthlyRequestLimit > 0) {
-				groupUsage, err := a.getGroupUsageCached(*apiKey.GroupID, now.Year(), int(now.Month()))
+				groupUsage, err := a.getGroupUsageCached(*apiKey.GroupID, now.UTC().Year(), int(now.UTC().Month()))
 				if err != nil {
 					writeError(w, http.StatusInternalServerError, "failed to check group quota")
 					return
@@ -224,7 +223,44 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 		// Batch last_used_at update
 		a.markLastUsed(token)
 
-		ctx := context.WithValue(r.Context(), clientKeyContextKey, token)
+		// Extract requested plan from body (supports auto-<plan> and plan/model syntax)
+		lr := io.LimitReader(r.Body, maxRequestBodySize+1)
+		bodyBytes, err := io.ReadAll(lr)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "failed to read body")
+			return
+		}
+		if int64(len(bodyBytes)) > maxRequestBodySize {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		var body map[string]interface{}
+		if err := json.Unmarshal(bodyBytes, &body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		planSlug := resolvePlanFromBody(body)
+
+		ctx := context.WithValue(r.Context(), bodyContextKey, body)
+		r = r.WithContext(ctx)
+
+		// Plan access check
+		if len(apiKey.Plans) > 0 {
+			allowed := false
+			for _, p := range apiKey.Plans {
+				if p == planSlug || p == "*" {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				writeError(w, http.StatusForbidden, "plan not allowed for this key")
+				return
+			}
+		}
+
+		ctx = context.WithValue(r.Context(), clientKeyContextKey, token)
 		ctx = context.WithValue(ctx, apiKeyContextKey, apiKey)
 		ctx = context.WithValue(ctx, planSlugContextKey, planSlug)
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -255,6 +291,14 @@ func PlanSlugFromContext(ctx context.Context) string {
 	return ""
 }
 
+// BodyFromContext extracts the parsed request body from the request context.
+func BodyFromContext(ctx context.Context) (map[string]interface{}, bool) {
+	if v, ok := ctx.Value(bodyContextKey).(map[string]interface{}); ok {
+		return v, true
+	}
+	return nil, false
+}
+
 func (a *Auth) getKeyCached(key string) (*types.APIKey, error) {
 	a.keyCacheMu.RLock()
 	entry, ok := a.keyCache[key]
@@ -269,8 +313,11 @@ func (a *Auth) getKeyCached(key string) (*types.APIKey, error) {
 	}
 
 	a.keyCacheMu.Lock()
+	defer a.keyCacheMu.Unlock()
+	if entry, ok := a.keyCache[key]; ok && time.Since(entry.loadedAt) < a.keyCacheTTL {
+		return entry.key, nil
+	}
 	a.keyCache[key] = cachedKey{key: k, loadedAt: time.Now()}
-	a.keyCacheMu.Unlock()
 	return k, nil
 }
 
@@ -289,8 +336,11 @@ func (a *Auth) getUsageCached(key string, year, month int) (*db.MonthlyUsage, er
 	}
 
 	a.usageCacheMu.Lock()
+	defer a.usageCacheMu.Unlock()
+	if entry, ok := a.usageCache[cacheKey]; ok && time.Since(entry.loadedAt) < a.usageCacheTTL {
+		return entry.usage, nil
+	}
 	a.usageCache[cacheKey] = usageCacheEntry{usage: usage, loadedAt: time.Now()}
-	a.usageCacheMu.Unlock()
 	return usage, nil
 }
 
@@ -308,8 +358,11 @@ func (a *Auth) getGroupCached(id int64) (*types.KeyGroup, error) {
 	}
 
 	a.groupCacheMu.Lock()
+	defer a.groupCacheMu.Unlock()
+	if entry, ok := a.groupCache[id]; ok && time.Since(entry.loadedAt) < a.groupCacheTTL {
+		return entry.group, nil
+	}
 	a.groupCache[id] = groupCacheEntry{group: group, loadedAt: time.Now()}
-	a.groupCacheMu.Unlock()
 	return group, nil
 }
 
@@ -328,8 +381,11 @@ func (a *Auth) getGroupUsageCached(groupID int64, year, month int) (*db.MonthlyU
 	}
 
 	a.usageCacheMu.Lock()
+	defer a.usageCacheMu.Unlock()
+	if entry, ok := a.usageCache[cacheKey]; ok && time.Since(entry.loadedAt) < a.usageCacheTTL {
+		return entry.usage, nil
+	}
 	a.usageCache[cacheKey] = usageCacheEntry{usage: usage, loadedAt: time.Now()}
-	a.usageCacheMu.Unlock()
 	return usage, nil
 }
 
@@ -340,53 +396,65 @@ func (a *Auth) markLastUsed(key string) {
 }
 
 func (a *Auth) lastUsedFlushWorker() {
+	defer a.wg.Done()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		a.lastUsedMu.Lock()
-		batch := a.lastUsedBatch
-		a.lastUsedBatch = make(map[string]struct{})
-		a.lastUsedMu.Unlock()
+	for {
+		select {
+		case <-ticker.C:
+			a.lastUsedMu.Lock()
+			batch := a.lastUsedBatch
+			a.lastUsedBatch = make(map[string]struct{})
+			a.lastUsedMu.Unlock()
 
-		if len(batch) == 0 {
-			continue
-		}
-		now := time.Now().Unix()
-		for key := range batch {
-			_ = a.db.UpdateKeyLastUsedWithTime(key, now)
+			if len(batch) == 0 {
+				continue
+			}
+			now := time.Now().Unix()
+			for key := range batch {
+				_ = a.db.UpdateKeyLastUsedWithTime(key, now)
+			}
+		case <-a.stop:
+			return
 		}
 	}
 }
 
 func (a *Auth) cacheEvictionWorker() {
+	defer a.wg.Done()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		now := time.Now()
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
 
-		a.keyCacheMu.Lock()
-		for k, v := range a.keyCache {
-			if now.Sub(v.loadedAt) > a.keyCacheTTL {
-				delete(a.keyCache, k)
+			a.keyCacheMu.Lock()
+			for k, v := range a.keyCache {
+				if now.Sub(v.loadedAt) > a.keyCacheTTL {
+					delete(a.keyCache, k)
+				}
 			}
-		}
-		a.keyCacheMu.Unlock()
+			a.keyCacheMu.Unlock()
 
-		a.usageCacheMu.Lock()
-		for k, v := range a.usageCache {
-			if now.Sub(v.loadedAt) > a.usageCacheTTL {
-				delete(a.usageCache, k)
+			a.usageCacheMu.Lock()
+			for k, v := range a.usageCache {
+				if now.Sub(v.loadedAt) > a.usageCacheTTL {
+					delete(a.usageCache, k)
+				}
 			}
-		}
-		a.usageCacheMu.Unlock()
+			a.usageCacheMu.Unlock()
 
-		a.groupCacheMu.Lock()
-		for k, v := range a.groupCache {
-			if now.Sub(v.loadedAt) > a.groupCacheTTL {
-				delete(a.groupCache, k)
+			a.groupCacheMu.Lock()
+			for k, v := range a.groupCache {
+				if now.Sub(v.loadedAt) > a.groupCacheTTL {
+					delete(a.groupCache, k)
+				}
 			}
+			a.groupCacheMu.Unlock()
+		case <-a.stop:
+			return
 		}
-		a.groupCacheMu.Unlock()
 	}
 }
 
@@ -395,14 +463,7 @@ func (a *Auth) checkAndSendQuotaAlert(apiKey *types.APIKey, usage *db.MonthlyUsa
 		return
 	}
 	now := time.Now()
-	alertKey := fmt.Sprintf("%s:%d-%02d", apiKey.Key, now.Year(), now.Month())
-
-	a.alertedMu.Lock()
-	if a.alertedKeys[alertKey] {
-		a.alertedMu.Unlock()
-		return
-	}
-	a.alertedMu.Unlock()
+	alertKey := fmt.Sprintf("%s:%d-%02d", apiKey.Key, now.UTC().Year(), now.UTC().Month())
 
 	var percent float64
 	if apiKey.MonthlyTokenLimit > 0 {
@@ -418,12 +479,53 @@ func (a *Auth) checkAndSendQuotaAlert(apiKey *types.APIKey, usage *db.MonthlyUsa
 			percent = pct
 		}
 	}
-	if percent >= 80 {
-		a.alertedMu.Lock()
+	if percent < 80 {
+		return
+	}
+
+	a.alertedMu.Lock()
+	alreadyAlerted := a.alertedKeys[alertKey]
+	if !alreadyAlerted {
 		a.alertedKeys[alertKey] = true
-		a.alertedMu.Unlock()
+	}
+	a.alertedMu.Unlock()
+
+	if !alreadyAlerted {
 		alerts.SendWebhookQuotaAlert(apiKey.WebhookURL, apiKey.Name, percent, usage.RequestTokens, usage.ResponseTokens, usage.RequestCount)
 	}
+}
+
+// InvalidateKeyCache removes a key from the in-memory caches so
+// admin mutations take effect immediately.
+func (a *Auth) InvalidateKeyCache(key string) {
+	a.keyCacheMu.Lock()
+	delete(a.keyCache, key)
+	a.keyCacheMu.Unlock()
+
+	prefix := key + ":"
+	a.usageCacheMu.Lock()
+	for k := range a.usageCache {
+		if strings.HasPrefix(k, prefix) {
+			delete(a.usageCache, k)
+		}
+	}
+	a.usageCacheMu.Unlock()
+}
+
+// InvalidateGroupCache removes a group from the in-memory cache.
+func (a *Auth) InvalidateGroupCache(groupID int64) {
+	a.groupCacheMu.Lock()
+	delete(a.groupCache, groupID)
+	a.groupCacheMu.Unlock()
+
+	prefix := fmt.Sprintf("group:%d:", groupID)
+	a.usageCacheMu.Lock()
+	for k := range a.usageCache {
+		if strings.HasPrefix(k, prefix) {
+			delete(a.usageCache, k)
+		}
+	}
+	a.usageCacheMu.Unlock()
 }
 
 func isIPAllowed(ip string, allowed []string) bool {

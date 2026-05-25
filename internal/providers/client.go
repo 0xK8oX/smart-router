@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -33,13 +34,15 @@ func NewClient() *Client {
 				IdleConnTimeout:       90 * time.Second,
 				MaxIdleConns:          100,
 				MaxIdleConnsPerHost:   10,
+				ForceAttemptHTTP2:     true,
 			},
 		},
 	}
 }
 
 func buildEndpoint(baseURL string, format string) string {
-	base := strings.TrimSuffix(baseURL, "/v1")
+	base := strings.TrimSuffix(baseURL, "/")
+	base = strings.TrimSuffix(base, "/v1")
 	if format == "anthropic" {
 		return base + "/v1/messages"
 	}
@@ -51,10 +54,14 @@ func isKimiCodingEndpoint(baseURL string) bool {
 }
 
 func isNativeAnthropic(baseURL string) bool {
-	return strings.Contains(baseURL, "api.anthropic.com")
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	return u.Hostname() == "api.anthropic.com"
 }
 
-func (c *Client) doRequest(provider types.ProviderConfig, body map[string]interface{}, ctx context.Context, headers http.Header) (*http.Response, error) {
+func (c *Client) doRequest(ctx context.Context, provider types.ProviderConfig, body map[string]interface{}, headers http.Header) (*http.Response, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request body: %w", err)
@@ -73,6 +80,15 @@ func (c *Client) doRequest(provider types.ProviderConfig, body map[string]interf
 				req.Header.Add(k, v)
 			}
 		}
+	}
+
+	// Strip hop-by-hop and client-specific headers that must not reach upstream.
+	for _, h := range []string{
+		"Host", "Cookie", "Referer", "Connection", "Keep-Alive",
+		"Upgrade", "Accept-Encoding", "Content-Length", "Transfer-Encoding",
+		"Authorization", "x-api-key", "X-Admin-Key",
+	} {
+		req.Header.Del(h)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -111,9 +127,13 @@ func (c *cancelBody) Close() error {
 
 // Call makes a non-streaming request to the provider.
 // headers is forwarded as-is when clientFormat == provider.Format (passthrough mode).
-func (c *Client) Call(provider types.ProviderConfig, body map[string]interface{}, headers http.Header) (*http.Response, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(provider.Timeout)*time.Second)
-	resp, err := c.doRequest(provider, body, ctx, headers)
+func (c *Client) Call(ctx context.Context, provider types.ProviderConfig, body map[string]interface{}, headers http.Header) (*http.Response, error) {
+	timeout := time.Duration(provider.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	resp, err := c.doRequest(ctx, provider, body, headers)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -126,7 +146,11 @@ func (c *Client) Call(provider types.ProviderConfig, body map[string]interface{}
 // No hard timeout — streams can run indefinitely. The router's handler
 // timeout and upstream provider behavior are the natural boundaries.
 // headers is forwarded as-is when clientFormat == provider.Format (passthrough mode).
-func (c *Client) CallStream(provider types.ProviderConfig, body map[string]interface{}, headers http.Header) (*http.Response, error) {
-	body["stream"] = true
-	return c.doRequest(provider, body, context.Background(), headers)
+func (c *Client) CallStream(ctx context.Context, provider types.ProviderConfig, body map[string]interface{}, headers http.Header) (*http.Response, error) {
+	streamBody := make(map[string]interface{}, len(body)+1)
+	for k, v := range body {
+		streamBody[k] = v
+	}
+	streamBody["stream"] = true
+	return c.doRequest(ctx, provider, streamBody, headers)
 }

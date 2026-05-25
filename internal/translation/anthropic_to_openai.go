@@ -78,6 +78,10 @@ func TranslateAnthropicRequestToOpenAI(body map[string]interface{}) (map[string]
 							if text, ok := block["text"].(string); ok {
 								textParts = append(textParts, text)
 							}
+						case "thinking":
+							if t, ok := block["thinking"].(string); ok {
+								textParts = append(textParts, t)
+							}
 						case "tool_use":
 							id, _ := block["id"].(string)
 							name, _ := block["name"].(string)
@@ -231,7 +235,16 @@ func TranslateAnthropicRequestToOpenAI(body map[string]interface{}) (map[string]
 				}
 			}
 		case string:
-			result["tool_choice"] = tc
+			switch tc {
+			case "auto":
+				result["tool_choice"] = "auto"
+			case "any":
+				result["tool_choice"] = "required"
+			case "none":
+				result["tool_choice"] = "none"
+			default:
+				result["tool_choice"] = tc
+			}
 		}
 	}
 

@@ -35,6 +35,7 @@ var migrations = []string{
 	`CREATE INDEX IF NOT EXISTS idx_stats_created ON request_stats(created_at);`,
 	`ALTER TABLE request_stats ADD COLUMN client_key TEXT;`,
 	`ALTER TABLE request_stats ADD COLUMN key_mask TEXT;`,
+	`ALTER TABLE request_stats ADD COLUMN target_provider TEXT;`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_client_key ON request_stats(client_key);`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_client_created ON request_stats(client_key, created_at);`,
 	`CREATE TABLE IF NOT EXISTS plans (
@@ -84,11 +85,14 @@ var migrations = []string{
 }
 
 type DB struct {
-	conn     *sql.DB
-	statChan chan types.StatRecord
-	stopChan chan struct{}
-	wg       sync.WaitGroup
-	encKey   []byte
+	conn              *sql.DB
+	statChan          chan types.StatRecord
+	stopChan          chan struct{}
+	wg                sync.WaitGroup
+	encKey            []byte
+	pricingCache      map[string][2]float64
+	pricingCacheMu    sync.RWMutex
+	pricingCacheUntil time.Time
 }
 
 func (d *DB) WithEncryptionKey(key []byte) *DB {
@@ -116,6 +120,10 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("set busy timeout: %w", err)
 	}
 
+	conn.SetMaxOpenConns(10)
+	conn.SetMaxIdleConns(5)
+	conn.SetConnMaxLifetime(time.Hour)
+
 	db := &DB{
 		conn:     conn,
 		statChan: make(chan types.StatRecord, 1000),
@@ -136,7 +144,8 @@ func (d *DB) migrate() error {
 		if _, err := d.conn.Exec(stmt); err != nil {
 			// Ignore "duplicate column name" errors from ALTER TABLE ADD COLUMN
 			// so migrations are idempotent on existing databases.
-			if strings.Contains(err.Error(), "duplicate column name") {
+			if strings.HasPrefix(strings.ToUpper(stmt), "ALTER TABLE") &&
+				strings.Contains(err.Error(), "duplicate column name") {
 				continue
 			}
 			return err
@@ -254,6 +263,9 @@ func (d *DB) startCleanupWorker() {
 				if _, err := d.conn.Exec(`DELETE FROM request_stats WHERE created_at < ?`, cutoff); err != nil {
 					log.Printf("[DB] stats cleanup failed: %v", err)
 				}
+				if _, err := d.conn.Exec(`PRAGMA wal_checkpoint(PASSIVE);`); err != nil {
+					log.Printf("[DB] WAL checkpoint failed: %v", err)
+				}
 			case <-d.stopChan:
 				return
 			}
@@ -263,8 +275,11 @@ func (d *DB) startCleanupWorker() {
 
 // RecordStatAsync sends a stat record to the background worker.
 // If the channel is full, it falls back to synchronous insertion.
+// During shutdown, stats are silently dropped to avoid panicking on a closed channel.
 func (d *DB) RecordStatAsync(r types.StatRecord) {
 	select {
+	case <-d.stopChan:
+		return
 	case d.statChan <- r:
 	default:
 		// Channel full — write synchronously so we don't drop stats
@@ -337,7 +352,7 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 
 func (d *DB) SavePlan(slug string, config types.PlanConfig) error {
 	// Deep-copy and encrypt provider API keys before saving.
-	if d.encKey != nil {
+	if len(d.encKey) > 0 {
 		config = clonePlanConfig(config)
 		for i := range config.Providers {
 			if config.Providers[i].APIKey != "" {
@@ -390,7 +405,9 @@ func (d *DB) GetPlan(slug string) (*types.PlanConfig, error) {
 	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
 		return nil, fmt.Errorf("unmarshal plan config: %w", err)
 	}
-	decryptPlanProviders(d.encKey, &config)
+	if err := decryptPlanProviders(d.encKey, &config); err != nil {
+		return nil, err
+	}
 	return &config, nil
 }
 
@@ -412,7 +429,9 @@ func (d *DB) ListPlans() (map[string]types.PlanConfig, error) {
 		if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
 			return nil, fmt.Errorf("unmarshal plan config: %w", err)
 		}
-		decryptPlanProviders(d.encKey, &config)
+		if err := decryptPlanProviders(d.encKey, &config); err != nil {
+			return nil, err
+		}
 		plans[slug] = config
 	}
 
@@ -423,9 +442,9 @@ func (d *DB) ListPlans() (map[string]types.PlanConfig, error) {
 	return plans, nil
 }
 
-func decryptPlanProviders(key []byte, config *types.PlanConfig) {
+func decryptPlanProviders(key []byte, config *types.PlanConfig) error {
 	if key == nil {
-		return
+		return nil
 	}
 	for i := range config.Providers {
 		if config.Providers[i].APIKey == "" {
@@ -433,17 +452,20 @@ func decryptPlanProviders(key []byte, config *types.PlanConfig) {
 		}
 		decrypted, err := decryptValue(key, config.Providers[i].APIKey)
 		if err != nil {
-			// Leave as-is (legacy plaintext or corrupt); don't break loading
-			continue
+			return fmt.Errorf("decrypt api_key for provider %s: %w", config.Providers[i].Name, err)
 		}
 		config.Providers[i].APIKey = decrypted
 	}
+	return nil
 }
 
 func (d *DB) DeletePlan(slug string) error {
-	_, err := d.conn.Exec(`DELETE FROM plans WHERE slug = ?`, slug)
+	res, err := d.conn.Exec(`DELETE FROM plans WHERE slug = ?`, slug)
 	if err != nil {
 		return fmt.Errorf("delete plan: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("plan not found")
 	}
 	return nil
 }
@@ -580,9 +602,15 @@ func scanAPIKey(rows *sql.Rows) (types.APIKey, error) {
 	if webhookURL.Valid {
 		k.WebhookURL = webhookURL.String
 	}
-	_ = json.Unmarshal([]byte(plansJSON), &k.Plans)
-	_ = json.Unmarshal([]byte(modelsJSON), &k.Models)
-	_ = json.Unmarshal([]byte(ipsJSON), &k.AllowedIPs)
+	if err := json.Unmarshal([]byte(plansJSON), &k.Plans); err != nil {
+		return k, fmt.Errorf("unmarshal plans: %w", err)
+	}
+	if err := json.Unmarshal([]byte(modelsJSON), &k.Models); err != nil {
+		return k, fmt.Errorf("unmarshal models: %w", err)
+	}
+	if err := json.Unmarshal([]byte(ipsJSON), &k.AllowedIPs); err != nil {
+		return k, fmt.Errorf("unmarshal allowed_ips: %w", err)
+	}
 	return k, nil
 }
 
@@ -595,10 +623,27 @@ func (d *DB) CountAPIKeys() (int, error) {
 	return count, nil
 }
 
+func marshalJSON(v interface{}) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("marshal JSON: %w", err)
+	}
+	return b, nil
+}
+
 func (d *DB) CreateAPIKey(key types.APIKey) error {
-	plansJSON, _ := json.Marshal(key.Plans)
-	modelsJSON, _ := json.Marshal(key.Models)
-	ipsJSON, _ := json.Marshal(key.AllowedIPs)
+	plansJSON, err := marshalJSON(key.Plans)
+	if err != nil {
+		return fmt.Errorf("create api key: plans: %w", err)
+	}
+	modelsJSON, err := marshalJSON(key.Models)
+	if err != nil {
+		return fmt.Errorf("create api key: models: %w", err)
+	}
+	ipsJSON, err := marshalJSON(key.AllowedIPs)
+	if err != nil {
+		return fmt.Errorf("create api key: allowed_ips: %w", err)
+	}
 	var expiresAt interface{}
 	if key.ExpiresAt != nil {
 		expiresAt = *key.ExpiresAt
@@ -607,13 +652,17 @@ func (d *DB) CreateAPIKey(key types.APIKey) error {
 	if key.GroupID != nil {
 		groupID = *key.GroupID
 	}
-	_, err := d.conn.Exec(`
+	disabled := 0
+	if key.Disabled {
+		disabled = 1
+	}
+	_, err = d.conn.Exec(`
 		INSERT INTO api_keys
 			(key, name, plans, models, allowed_ips, rate_limit_rpm, rate_limit_rpd, monthly_token_limit, monthly_request_limit, expires_at, disabled, created_at, webhook_url, group_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, key.Key, key.Name, string(plansJSON), string(modelsJSON), string(ipsJSON),
 		key.RateLimitRPM, key.RateLimitRPD, key.MonthlyTokenLimit, key.MonthlyRequestLimit,
-		expiresAt, 0, key.CreatedAt, key.WebhookURL, groupID)
+		expiresAt, disabled, key.CreatedAt, key.WebhookURL, groupID)
 	if err != nil {
 		return fmt.Errorf("create api key: %w", err)
 	}
@@ -631,6 +680,9 @@ func (d *DB) GetAPIKey(key string) (*types.APIKey, error) {
 	}
 	defer rows.Close()
 	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("query api key: %w", err)
+		}
 		return nil, fmt.Errorf("api key not found")
 	}
 	k, err := scanAPIKey(rows)
@@ -651,6 +703,9 @@ func (d *DB) GetAPIKeyByName(name string) (*types.APIKey, error) {
 	}
 	defer rows.Close()
 	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("query api key by name: %w", err)
+		}
 		return nil, fmt.Errorf("api key not found")
 	}
 	k, err := scanAPIKey(rows)
@@ -686,9 +741,18 @@ func (d *DB) ListAPIKeys() ([]types.APIKey, error) {
 }
 
 func (d *DB) UpdateAPIKey(key string, updates types.APIKey) error {
-	plansJSON, _ := json.Marshal(updates.Plans)
-	modelsJSON, _ := json.Marshal(updates.Models)
-	ipsJSON, _ := json.Marshal(updates.AllowedIPs)
+	plansJSON, err := marshalJSON(updates.Plans)
+	if err != nil {
+		return fmt.Errorf("update api key: plans: %w", err)
+	}
+	modelsJSON, err := marshalJSON(updates.Models)
+	if err != nil {
+		return fmt.Errorf("update api key: models: %w", err)
+	}
+	ipsJSON, err := marshalJSON(updates.AllowedIPs)
+	if err != nil {
+		return fmt.Errorf("update api key: allowed_ips: %w", err)
+	}
 	var expiresAt interface{}
 	if updates.ExpiresAt != nil {
 		expiresAt = *updates.ExpiresAt
@@ -697,7 +761,7 @@ func (d *DB) UpdateAPIKey(key string, updates types.APIKey) error {
 	if updates.GroupID != nil {
 		groupID = *updates.GroupID
 	}
-	_, err := d.conn.Exec(`
+	res, err := d.conn.Exec(`
 		UPDATE api_keys SET
 			name = ?, plans = ?, models = ?, allowed_ips = ?,
 			rate_limit_rpm = ?, rate_limit_rpd = ?,
@@ -711,13 +775,19 @@ func (d *DB) UpdateAPIKey(key string, updates types.APIKey) error {
 	if err != nil {
 		return fmt.Errorf("update api key: %w", err)
 	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("api key not found")
+	}
 	return nil
 }
 
 func (d *DB) DeleteAPIKey(key string) error {
-	_, err := d.conn.Exec(`DELETE FROM api_keys WHERE key = ?`, key)
+	res, err := d.conn.Exec(`DELETE FROM api_keys WHERE key = ?`, key)
 	if err != nil {
 		return fmt.Errorf("delete api key: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("api key not found")
 	}
 	return nil
 }
@@ -780,7 +850,7 @@ func (d *DB) ListKeyGroups() ([]types.KeyGroup, error) {
 }
 
 func (d *DB) UpdateKeyGroup(id int64, g types.KeyGroup) error {
-	_, err := d.conn.Exec(`
+	res, err := d.conn.Exec(`
 		UPDATE key_groups SET
 			name = ?, monthly_token_limit = ?, monthly_request_limit = ?, monthly_budget_limit = ?, webhook_url = ?
 		WHERE id = ?
@@ -788,15 +858,31 @@ func (d *DB) UpdateKeyGroup(id int64, g types.KeyGroup) error {
 	if err != nil {
 		return fmt.Errorf("update key group: %w", err)
 	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("key group not found")
+	}
 	return nil
 }
 
 func (d *DB) DeleteKeyGroup(id int64) error {
-	_, err := d.conn.Exec(`DELETE FROM key_groups WHERE id = ?`, id)
+	tx, err := d.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`UPDATE api_keys SET group_id = NULL WHERE group_id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("clear key group refs: %w", err)
+	}
+	res, err := tx.Exec(`DELETE FROM key_groups WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete key group: %w", err)
 	}
-	return nil
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("key group not found")
+	}
+	return tx.Commit()
 }
 
 func (d *DB) GetGroupMonthlyUsage(groupID int64, year, month int) (*MonthlyUsage, error) {
@@ -878,10 +964,13 @@ func (d *DB) RecordAudit(action, targetKey, actor, details string) error {
 
 func (d *DB) ListAuditLogs(limit int) ([]map[string]interface{}, error) {
 	query := `SELECT id, action, target_key, actor, details, created_at FROM audit_log ORDER BY created_at DESC, id DESC`
+	var rows *sql.Rows
+	var err error
 	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
+		rows, err = d.conn.Query(query+" LIMIT ?", limit)
+	} else {
+		rows, err = d.conn.Query(query)
 	}
-	rows, err := d.conn.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("list audit: %w", err)
 	}
@@ -938,7 +1027,55 @@ func (d *DB) GetModelPricing(model string) (float64, float64, error) {
 	return inputPrice, outputPrice, nil
 }
 
+func (d *DB) loadModelPricingMap() (map[string][2]float64, error) {
+	rows, err := d.conn.Query(`SELECT model, input_price_per_1k, output_price_per_1k FROM model_pricing`)
+	if err != nil {
+		return nil, fmt.Errorf("load pricing map: %w", err)
+	}
+	defer rows.Close()
+
+	pricing := make(map[string][2]float64)
+	for rows.Next() {
+		var model string
+		var inPrice, outPrice float64
+		if err := rows.Scan(&model, &inPrice, &outPrice); err != nil {
+			return nil, fmt.Errorf("scan pricing: %w", err)
+		}
+		pricing[model] = [2]float64{inPrice, outPrice}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+	return pricing, nil
+}
+
+func (d *DB) getCachedPricingMap() (map[string][2]float64, error) {
+	d.pricingCacheMu.RLock()
+	if d.pricingCache != nil && time.Now().Before(d.pricingCacheUntil) {
+		cache := d.pricingCache
+		d.pricingCacheMu.RUnlock()
+		return cache, nil
+	}
+	d.pricingCacheMu.RUnlock()
+
+	pricing, err := d.loadModelPricingMap()
+	if err != nil {
+		return nil, err
+	}
+
+	d.pricingCacheMu.Lock()
+	d.pricingCache = pricing
+	d.pricingCacheUntil = time.Now().Add(5 * time.Minute)
+	d.pricingCacheMu.Unlock()
+	return pricing, nil
+}
+
 func (d *DB) GetKeyMonthlyCost(key string, year, month int) (float64, error) {
+	pricing, err := d.getCachedPricingMap()
+	if err != nil {
+		return 0, err
+	}
+
 	start := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
 	end := start.AddDate(0, 1, 0)
 	rows, err := d.conn.Query(`
@@ -958,9 +1095,9 @@ func (d *DB) GetKeyMonthlyCost(key string, year, month int) (float64, error) {
 		if err := rows.Scan(&model, &reqTokens, &respTokens); err != nil {
 			return 0, fmt.Errorf("scan stat: %w", err)
 		}
-		inPrice, outPrice, _ := d.GetModelPricing(model)
-		totalCost += float64(reqTokens) / 1000.0 * inPrice
-		totalCost += float64(respTokens) / 1000.0 * outPrice
+		prices := pricing[model]
+		totalCost += float64(reqTokens) / 1000.0 * prices[0]
+		totalCost += float64(respTokens) / 1000.0 * prices[1]
 	}
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("rows error: %w", err)

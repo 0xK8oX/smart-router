@@ -1,11 +1,13 @@
 package router
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"smart-router/internal/db"
@@ -65,7 +67,7 @@ func TestRouteSuccess(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false, "openai", nil, "")
+	resp, provider, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -150,7 +152,7 @@ func TestRouteFailover(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false, "openai", nil, "")
+	resp, provider, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -232,7 +234,7 @@ func TestRouteAllFail(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, false, "openai", nil, "")
+	resp, _, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err == nil {
 		t.Fatal("expected error when all providers fail, got nil")
 	}
@@ -327,7 +329,7 @@ func TestRouteSkipsUnhealthyProvider(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false, "openai", nil, "")
+	resp, provider, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -410,7 +412,7 @@ func TestRouteOverridesModelWithProviderConfig(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, false, "openai", nil, "")
+	resp, _, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -475,7 +477,7 @@ func TestRouteStreaming(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, true, "openai", nil, "")
+	resp, _, err := router.Route(context.Background(), "pro", body, true, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -559,7 +561,7 @@ func TestRouteVirtualProvider(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("outer", body, false, "openai", nil, "")
+	resp, provider, err := router.Route(context.Background(), "outer", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -626,7 +628,7 @@ func TestRouteVirtualProviderMaxDepth(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("plan-a", body, false, "openai", nil, "")
+	resp, _, err := router.Route(context.Background(), "plan-a", body, false, "openai", nil, "")
 	if err == nil {
 		if resp != nil {
 			resp.Body.Close()
@@ -714,7 +716,7 @@ func TestRouteVirtualProviderFailover(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("outer", body, false, "openai", nil, "")
+	resp, provider, err := router.Route(context.Background(), "outer", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -795,21 +797,21 @@ func TestRouteRoundRobin(t *testing.T) {
 	}
 
 	// First request should hit provider-a
-	resp1, provider1, err := router.Route("rr", body, false, "openai", nil, "")
+	resp1, provider1, err := router.Route(context.Background(), "rr", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resp1.Body.Close()
 
 	// Second request should hit provider-b
-	resp2, provider2, err := router.Route("rr", body, false, "openai", nil, "")
+	resp2, provider2, err := router.Route(context.Background(), "rr", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resp2.Body.Close()
 
 	// Third request should hit provider-a again
-	resp3, provider3, err := router.Route("rr", body, false, "openai", nil, "")
+	resp3, provider3, err := router.Route(context.Background(), "rr", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -894,7 +896,7 @@ func TestRouteWeightedRoundRobin(t *testing.T) {
 	// With weights 3:1, first 3 requests should hit provider-a, then provider-b
 	names := make([]string, 4)
 	for i := 0; i < 4; i++ {
-		resp, provider, err := router.Route("wrr", body, false, "openai", nil, "")
+		resp, provider, err := router.Route(context.Background(), "wrr", body, false, "openai", nil, "")
 		if err != nil {
 			t.Fatalf("unexpected error on req %d: %v", i, err)
 		}
@@ -974,21 +976,21 @@ func TestRouteLRU(t *testing.T) {
 	}
 
 	// First request: both unused, provider-a first in plan order after LRU sort (equal -> stable-ish)
-	resp1, provider1, err := router.Route("lru", body, false, "openai", nil, "")
+	resp1, provider1, err := router.Route(context.Background(), "lru", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resp1.Body.Close()
 
 	// Second request: provider-a was just used, provider-b is LRU
-	resp2, provider2, err := router.Route("lru", body, false, "openai", nil, "")
+	resp2, provider2, err := router.Route(context.Background(), "lru", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resp2.Body.Close()
 
 	// Third request: provider-b was just used, provider-a is LRU
-	resp3, provider3, err := router.Route("lru", body, false, "openai", nil, "")
+	resp3, provider3, err := router.Route(context.Background(), "lru", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1052,7 +1054,7 @@ func TestInvalidatePlanCache(t *testing.T) {
 	}
 
 	// First route should load and cache the plan
-	resp1, provider1, err := router.Route("pro", body, false, "openai", nil, "")
+	resp1, provider1, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error on first route: %v", err)
 	}
@@ -1079,7 +1081,7 @@ func TestInvalidatePlanCache(t *testing.T) {
 	}
 
 	// Without invalidation, router should still use cached plan
-	resp2, provider2, err := router.Route("pro", body, false, "openai", nil, "")
+	resp2, provider2, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error on second route: %v", err)
 	}
@@ -1092,7 +1094,7 @@ func TestInvalidatePlanCache(t *testing.T) {
 	router.InvalidatePlanCache("pro")
 
 	// Next route should reload from DB and see the updated plan
-	resp3, provider3, err := router.Route("pro", body, false, "openai", nil, "")
+	resp3, provider3, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error after invalidate: %v", err)
 	}
@@ -1153,12 +1155,12 @@ func TestInvalidateAllPlanCache(t *testing.T) {
 	}
 
 	// Warm cache for both plans
-	resp1, _, err := router.Route("plan-a", body, false, "openai", nil, "")
+	resp1, _, err := router.Route(context.Background(), "plan-a", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	resp1.Body.Close()
-	resp2, _, err := router.Route("plan-b", body, false, "openai", nil, "")
+	resp2, _, err := router.Route(context.Background(), "plan-b", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1186,7 +1188,7 @@ func TestInvalidateAllPlanCache(t *testing.T) {
 	router.InvalidateAllPlanCache()
 
 	// Both should now reload from DB
-	resp3, provider3, err := router.Route("plan-a", body, false, "openai", nil, "")
+	resp3, provider3, err := router.Route(context.Background(), "plan-a", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error after invalidate all: %v", err)
 	}
@@ -1195,7 +1197,7 @@ func TestInvalidateAllPlanCache(t *testing.T) {
 		t.Errorf("expected provider p1-new, got %s", provider3.Name)
 	}
 
-	resp4, provider4, err := router.Route("plan-b", body, false, "openai", nil, "")
+	resp4, provider4, err := router.Route(context.Background(), "plan-b", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error after invalidate all: %v", err)
 	}
@@ -1261,7 +1263,7 @@ func TestRouteNetworkError(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, false, "openai", nil, "")
+	resp, _, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err == nil {
 		if resp != nil {
 			resp.Body.Close()
@@ -1321,7 +1323,7 @@ func TestRouteTranslationError(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, false, "openai", nil, "")
+	resp, _, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err == nil {
 		if resp != nil {
 			resp.Body.Close()
@@ -1330,6 +1332,81 @@ func TestRouteTranslationError(t *testing.T) {
 	}
 	if resp != nil {
 		resp.Body.Close()
+	}
+}
+
+func TestGetPlanCached_ConcurrentMiss(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"concurrent"}`))
+	}))
+	defer server.Close()
+
+	sqlitePath := "/tmp/test_router_concurrent.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-concurrent-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health tracker: %v", err)
+	}
+	defer ht.Close()
+
+	plan := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "p1", BaseURL: server.URL, Model: "gpt-4", Format: "openai", Timeout: 5, APIKey: "sk-a"},
+		},
+	}
+	if err := database.SavePlan("concurrent", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+
+	body := map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	}
+
+	// Warm cache
+	resp1, _, err := router.Route(context.Background(), "concurrent", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("warmup route: %v", err)
+	}
+	resp1.Body.Close()
+
+	// Invalidate so all concurrent requests miss together
+	router.InvalidatePlanCache("concurrent")
+
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n)
+	errors := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			resp, _, err := router.Route(context.Background(), "concurrent", body, false, "openai", nil, "")
+			if err != nil {
+				errors <- err
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Fatalf("concurrent route failed: %v", err)
 	}
 }
 
@@ -1397,7 +1474,7 @@ func TestRouteAllProvidersExhausted(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, _, err := router.Route("pro", body, false, "openai", nil, "")
+	resp, _, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err == nil {
 		if resp != nil {
 			resp.Body.Close()
@@ -1475,7 +1552,7 @@ func TestRouteSelectsMatchingModelProvider(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route("pro", body, false, "openai", nil, "")
+	resp, provider, err := router.Route(context.Background(), "pro", body, false, "openai", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
