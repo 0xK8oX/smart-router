@@ -225,6 +225,7 @@ func OpenAIToAnthropicStream(reader io.Reader) io.Reader {
 					}
 				}
 				if usage, ok := event["usage"].(map[string]interface{}); ok {
+					emitMessageStart()
 					translatedUsage := make(map[string]interface{})
 					if v, ok := usage["prompt_tokens"]; ok {
 						translatedUsage["input_tokens"] = v
@@ -332,6 +333,7 @@ func OpenAIToAnthropicStream(reader io.Reader) io.Reader {
 
 			// Handle finish_reason
 			if finishReason != "" {
+				emitMessageStart()
 				stopReason := finishReason
 				switch finishReason {
 				case "tool_calls":
