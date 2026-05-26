@@ -93,6 +93,7 @@ func main() {
 
 	rateLimiter := auth.NewRateLimiter()
 	authHandler := api.NewAuth(database, rateLimiter)
+	defer authHandler.Close()
 	server := api.NewServer(r, ht, database, authHandler, adminKey)
 
 	// Bootstrap a default API key if none exist

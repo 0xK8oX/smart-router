@@ -175,7 +175,7 @@ func (r *Router) applyStrategy(planSlug string, strategy string, providers []typ
 		sort.Slice(sorted, func(i, j int) bool {
 			li := snapshot[sorted[i].Name]
 			lj := snapshot[sorted[j].Name]
-			return li.Before(lj) || li.Equal(lj)
+			return li.Before(lj)
 		})
 		return sorted
 	default:

@@ -29,6 +29,7 @@ func OpenAIToAnthropicStream(reader io.Reader) io.Reader {
 		var msgID string
 		var model string
 		messageStarted := false
+		messageStopped := false
 		textBlockStarted := false
 		thinkingBlockStarted := false
 		toolCalls := make(map[int]*toolCallState)
@@ -115,12 +116,17 @@ func OpenAIToAnthropicStream(reader io.Reader) io.Reader {
 			}
 		}
 
-		emitMessageDelta := func(stopReason string) {
+		emitMessageDelta := func(stopReason string, usage map[string]interface{}) {
 			msgDelta := map[string]interface{}{
 				"type": "message_delta",
 				"delta": map[string]interface{}{
 					"stop_reason": stopReason,
 				},
+			}
+			if usage != nil {
+				msgDelta["usage"] = usage
+			} else {
+				msgDelta["usage"] = map[string]interface{}{"output_tokens": 0}
 			}
 			b, err := json.Marshal(msgDelta)
 			if err != nil {
@@ -130,6 +136,32 @@ func OpenAIToAnthropicStream(reader io.Reader) io.Reader {
 			if _, err := pw.Write([]byte("event: message_delta\ndata: " + string(b) + "\n\n")); err != nil {
 				pw.CloseWithError(err)
 				return
+			}
+		}
+
+		closeOpenBlocks := func() {
+			if textBlockStarted {
+				emitContentBlockStop(0)
+				textBlockStarted = false
+			}
+			if thinkingBlockStarted {
+				emitContentBlockStop(0)
+				thinkingBlockStarted = false
+			}
+			for idx := range toolCalls {
+				emitContentBlockStop(idx)
+			}
+			toolCalls = make(map[int]*toolCallState)
+		}
+
+		emitMessageStop := func() {
+			if messageStarted && !messageStopped {
+				closeOpenBlocks()
+				if _, err := pw.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")); err != nil {
+					pw.CloseWithError(err)
+					return
+				}
+				messageStopped = true
 			}
 		}
 
@@ -150,12 +182,7 @@ func OpenAIToAnthropicStream(reader io.Reader) io.Reader {
 			}
 
 			if data == "[DONE]" {
-				if messageStarted {
-					if _, err := pw.Write([]byte("event: message_stop\ndata: {}\n\n")); err != nil {
-						pw.CloseWithError(err)
-						return
-					}
-				}
+				emitMessageStop()
 				continue
 			}
 
@@ -316,19 +343,22 @@ func OpenAIToAnthropicStream(reader io.Reader) io.Reader {
 				case "stop":
 					stopReason = "end_turn"
 				}
-				if textBlockStarted {
-					emitContentBlockStop(0)
-					textBlockStarted = false
+				closeOpenBlocks()
+				var translatedUsage map[string]interface{}
+				if usage, ok := event["usage"].(map[string]interface{}); ok {
+					translatedUsage = make(map[string]interface{})
+					if v, ok := usage["prompt_tokens"]; ok {
+						translatedUsage["input_tokens"] = v
+					} else if v, ok := usage["input_tokens"]; ok {
+						translatedUsage["input_tokens"] = v
+					}
+					if v, ok := usage["completion_tokens"]; ok {
+						translatedUsage["output_tokens"] = v
+					} else if v, ok := usage["output_tokens"]; ok {
+						translatedUsage["output_tokens"] = v
+					}
 				}
-				if thinkingBlockStarted {
-					emitContentBlockStop(0)
-					thinkingBlockStarted = false
-				}
-				for idx := range toolCalls {
-					emitContentBlockStop(idx)
-				}
-				toolCalls = make(map[int]*toolCallState)
-				emitMessageDelta(stopReason)
+				emitMessageDelta(stopReason, translatedUsage)
 			}
 		}
 
@@ -337,12 +367,7 @@ func OpenAIToAnthropicStream(reader io.Reader) io.Reader {
 			return
 		}
 		// Stream ended without [DONE] — some proxies omit it.
-		if messageStarted {
-			if _, err := pw.Write([]byte("event: message_stop\ndata: {}\n\n")); err != nil {
-				pw.CloseWithError(err)
-				return
-			}
-		}
+		emitMessageStop()
 	}()
 
 	return pr

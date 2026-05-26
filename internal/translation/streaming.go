@@ -183,6 +183,36 @@ func anthropicToOpenAIStream(reader io.Reader) io.Reader {
 					continue
 				}
 
+				// Thinking delta
+				if thinking, ok := delta["thinking"].(string); ok && thinking != "" {
+					chunk := map[string]interface{}{
+						"id":      id,
+						"object":  "chat.completion.chunk",
+						"model":   model,
+						"choices": []map[string]interface{}{
+							{
+								"index": 0,
+								"delta": map[string]interface{}{
+									"reasoning": thinking,
+								},
+							},
+						},
+					}
+					if !roleSent {
+						chunk["choices"].([]map[string]interface{})[0]["delta"].(map[string]interface{})["role"] = "assistant"
+						roleSent = true
+					}
+					b, err := json.Marshal(chunk)
+					if err != nil {
+						pw.CloseWithError(err)
+						return
+					}
+					if _, err := pw.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
+						pw.CloseWithError(err)
+						return
+					}
+				}
+
 				// Text delta
 				text, _ := delta["text"].(string)
 				if text == "" {

@@ -401,15 +401,20 @@ func (s *Server) proxyStream(ctx context.Context, w http.ResponseWriter, bodyRea
 	}
 
 	type readResult struct {
-		n   int
-		err error
+		data []byte
+		err  error
 	}
 	readCh := make(chan readResult, 1)
 	go func() {
 		for {
 			n, err := bodyReader.Read(buf)
+			var data []byte
+			if n > 0 {
+				data = make([]byte, n)
+				copy(data, buf[:n])
+			}
 			select {
-			case readCh <- readResult{n: n, err: err}:
+			case readCh <- readResult{data: data, err: err}:
 			case <-ctx.Done():
 				return
 			}
@@ -425,15 +430,15 @@ func (s *Server) proxyStream(ctx context.Context, w http.ResponseWriter, bodyRea
 			recordStat("failure")
 			return
 		case result := <-readCh:
-			if result.n > 0 {
-				if _, werr := w.Write(buf[:result.n]); werr != nil {
+			if len(result.data) > 0 {
+				if _, werr := w.Write(result.data); werr != nil {
 					recordStat("failure")
 					return
 				}
 				if ok {
 					flusher.Flush()
 				}
-				captured = append(captured, buf[:result.n]...)
+				captured = append(captured, result.data...)
 				if len(captured) > maxCapture {
 					captured = captured[len(captured)-maxCapture:]
 				}
@@ -689,13 +694,15 @@ func (s *Server) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slug := mux.Vars(r)["slug"]
-	var plan types.PlanConfig
-	if err := json.NewDecoder(r.Body).Decode(&plan); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	existing, err := s.db.GetPlan(slug)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "plan not found")
 		return
 	}
-	if _, err := s.db.GetPlan(slug); err != nil {
-		writeError(w, http.StatusNotFound, "plan not found")
+	// Start from existing record so omitted fields are preserved.
+	plan := *existing
+	if err := json.NewDecoder(r.Body).Decode(&plan); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 
@@ -1052,7 +1059,8 @@ func (s *Server) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "key not found")
 		return
 	}
-	var k types.APIKey
+	// Start from existing record so omitted fields are preserved.
+	k := *existing
 	if err := json.Unmarshal(bodyBytes, &k); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return

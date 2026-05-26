@@ -304,7 +304,8 @@ func (a *Auth) getKeyCached(key string) (*types.APIKey, error) {
 	entry, ok := a.keyCache[key]
 	a.keyCacheMu.RUnlock()
 	if ok && time.Since(entry.loadedAt) < a.keyCacheTTL {
-		return entry.key, nil
+		copy := *entry.key
+		return &copy, nil
 	}
 
 	k, err := a.db.GetAPIKey(key)
@@ -315,10 +316,12 @@ func (a *Auth) getKeyCached(key string) (*types.APIKey, error) {
 	a.keyCacheMu.Lock()
 	defer a.keyCacheMu.Unlock()
 	if entry, ok := a.keyCache[key]; ok && time.Since(entry.loadedAt) < a.keyCacheTTL {
-		return entry.key, nil
+		copy := *entry.key
+		return &copy, nil
 	}
 	a.keyCache[key] = cachedKey{key: k, loadedAt: time.Now()}
-	return k, nil
+	copy := *k
+	return &copy, nil
 }
 
 func (a *Auth) getUsageCached(key string, year, month int) (*db.MonthlyUsage, error) {
@@ -327,7 +330,8 @@ func (a *Auth) getUsageCached(key string, year, month int) (*db.MonthlyUsage, er
 	entry, ok := a.usageCache[cacheKey]
 	a.usageCacheMu.RUnlock()
 	if ok && time.Since(entry.loadedAt) < a.usageCacheTTL {
-		return entry.usage, nil
+		copy := *entry.usage
+		return &copy, nil
 	}
 
 	usage, err := a.db.GetKeyMonthlyUsage(key, year, month)
@@ -338,10 +342,12 @@ func (a *Auth) getUsageCached(key string, year, month int) (*db.MonthlyUsage, er
 	a.usageCacheMu.Lock()
 	defer a.usageCacheMu.Unlock()
 	if entry, ok := a.usageCache[cacheKey]; ok && time.Since(entry.loadedAt) < a.usageCacheTTL {
-		return entry.usage, nil
+		copy := *entry.usage
+		return &copy, nil
 	}
 	a.usageCache[cacheKey] = usageCacheEntry{usage: usage, loadedAt: time.Now()}
-	return usage, nil
+	copy := *usage
+	return &copy, nil
 }
 
 func (a *Auth) getGroupCached(id int64) (*types.KeyGroup, error) {
@@ -349,7 +355,8 @@ func (a *Auth) getGroupCached(id int64) (*types.KeyGroup, error) {
 	entry, ok := a.groupCache[id]
 	a.groupCacheMu.RUnlock()
 	if ok && time.Since(entry.loadedAt) < a.groupCacheTTL {
-		return entry.group, nil
+		copy := *entry.group
+		return &copy, nil
 	}
 
 	group, err := a.db.GetKeyGroup(id)
@@ -360,10 +367,12 @@ func (a *Auth) getGroupCached(id int64) (*types.KeyGroup, error) {
 	a.groupCacheMu.Lock()
 	defer a.groupCacheMu.Unlock()
 	if entry, ok := a.groupCache[id]; ok && time.Since(entry.loadedAt) < a.groupCacheTTL {
-		return entry.group, nil
+		copy := *entry.group
+		return &copy, nil
 	}
 	a.groupCache[id] = groupCacheEntry{group: group, loadedAt: time.Now()}
-	return group, nil
+	copy := *group
+	return &copy, nil
 }
 
 func (a *Auth) getGroupUsageCached(groupID int64, year, month int) (*db.MonthlyUsage, error) {
@@ -372,7 +381,8 @@ func (a *Auth) getGroupUsageCached(groupID int64, year, month int) (*db.MonthlyU
 	entry, ok := a.usageCache[cacheKey]
 	a.usageCacheMu.RUnlock()
 	if ok && time.Since(entry.loadedAt) < a.usageCacheTTL {
-		return entry.usage, nil
+		copy := *entry.usage
+		return &copy, nil
 	}
 
 	usage, err := a.db.GetGroupMonthlyUsage(groupID, year, month)
@@ -383,10 +393,12 @@ func (a *Auth) getGroupUsageCached(groupID int64, year, month int) (*db.MonthlyU
 	a.usageCacheMu.Lock()
 	defer a.usageCacheMu.Unlock()
 	if entry, ok := a.usageCache[cacheKey]; ok && time.Since(entry.loadedAt) < a.usageCacheTTL {
-		return entry.usage, nil
+		copy := *entry.usage
+		return &copy, nil
 	}
 	a.usageCache[cacheKey] = usageCacheEntry{usage: usage, loadedAt: time.Now()}
-	return usage, nil
+	copy := *usage
+	return &copy, nil
 }
 
 func (a *Auth) markLastUsed(key string) {
