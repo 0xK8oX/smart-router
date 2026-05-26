@@ -1278,11 +1278,13 @@ func (s *Server) handleUpdateGroup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	if err := json.Unmarshal(bodyBytes, g); err != nil {
+	// Start from existing record so omitted fields are preserved.
+	updated := *g
+	if err := json.Unmarshal(bodyBytes, &updated); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if err := s.db.UpdateKeyGroup(id, *g); err != nil {
+	if err := s.db.UpdateKeyGroup(id, updated); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
