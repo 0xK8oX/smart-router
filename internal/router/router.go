@@ -604,6 +604,7 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			KeyMask:     types.MaskAPIKey(provider.APIKey),
 			ClientKey:   clientKey,
 			Source:      source,
+			UserAgent:   userAgent,
 			Status:      "failure",
 			StatusCode:  resp.StatusCode,
 			ErrorReason: health.ClassifyFailure(resp.StatusCode, errBody),
