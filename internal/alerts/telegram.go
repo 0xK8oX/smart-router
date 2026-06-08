@@ -150,6 +150,8 @@ func (b *Bot) buildReply(text string) string {
 		return b.cmdKeyUsage(args)
 	case "/providers":
 		return b.cmdProviders()
+	case "/sources":
+		return b.cmdSources()
 	case "/reset":
 		return b.cmdReset(args)
 	case "/help", "/start":
@@ -280,7 +282,11 @@ func (b *Bot) cmdStats(args []string) string {
 		if s.Status != "success" {
 			emoji = "🔴"
 		}
-		lines = append(lines, fmt.Sprintf("%s `%s/%s` %s %dms %s tok", emoji, s.Plan, s.Provider, s.Status, s.LatencyMs, formatNumber(int64(s.TotalTokens))))
+		source := s.Source
+		if source == "" {
+			source = "?"
+		}
+		lines = append(lines, fmt.Sprintf("%s `%s/%s` [%s] %s %dms %s tok", emoji, s.Plan, s.Provider, source, s.Status, s.LatencyMs, formatNumber(int64(s.TotalTokens))))
 	}
 
 	return strings.Join(lines, "\n")
@@ -633,6 +639,7 @@ func (b *Bot) cmdHelp() string {
 /top — Top providers by usage
 /failures — Recent failed requests
 /providers — List all providers with masked keys
+/sources — Per-client request/token breakdown (claude-code, hermes, etc)
 /keys — List all API keys
 /key <key_or_name> — Show key details and usage
 /keyusage <key_or_name> [5h|1d|1w|30d|1m] — Usage for specific key
@@ -861,3 +868,66 @@ func (b *Bot) sendMessage(chatID int64, text string) {
 		log.Printf("telegram API error %d: %s", resp.StatusCode, string(respBody))
 	}
 }
+
+func (b *Bot) cmdSources() string {
+	stats, err := b.db.GetStats("", "", 1000)
+	if err != nil {
+		return "Error fetching stats."
+	}
+
+	type sourceStat struct {
+		requests int64
+		tokens   int64
+		success  int64
+		failure  int64
+	}
+	agg := make(map[string]*sourceStat)
+
+	for _, s := range stats {
+		src := s.Source
+		if src == "" {
+			src = "unknown"
+		}
+		if agg[src] == nil {
+			agg[src] = &sourceStat{}
+		}
+		agg[src].requests++
+		agg[src].tokens += int64(s.TotalTokens)
+		if s.Status == "success" {
+			agg[src].success++
+		} else {
+			agg[src].failure++
+		}
+	}
+
+	if len(agg) == 0 {
+		return "No stats recorded yet."
+	}
+
+	type item struct {
+		name     string
+		requests int64
+		tokens   int64
+		success  int64
+		failure  int64
+	}
+	var items []item
+	for name, ps := range agg {
+		items = append(items, item{name, ps.requests, ps.tokens, ps.success, ps.failure})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].requests > items[j].requests
+	})
+
+	var lines []string
+	lines = append(lines, "*Request Sources*")
+	for _, it := range items {
+		pct := int64(0)
+		if it.requests > 0 {
+			pct = it.success * 100 / it.requests
+		}
+		lines = append(lines, fmt.Sprintf("  `%s` — %s req, %s tok, %d%% success", it.name, formatNumber(it.requests), formatNumber(it.tokens), pct))
+	}
+	return strings.Join(lines, "\n")
+}
+
