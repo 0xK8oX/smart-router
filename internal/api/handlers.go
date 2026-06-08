@@ -1117,7 +1117,7 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_ = s.db.RecordAudit("key_created", req.Key, r.Header.Get("X-Admin-Key"), "")
+	_ = s.db.RecordAudit("key_created", types.MaskAPIKey(req.Key), types.MaskAPIKey(r.Header.Get("X-Admin-Key")), "")
 	writeJSON(w, http.StatusOK, map[string]string{"key": req.Key})
 }
 
@@ -1198,7 +1198,7 @@ func (s *Server) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
 	if s.auth != nil {
 		s.auth.InvalidateKeyCache(key)
 	}
-	_ = s.db.RecordAudit("key_updated", key, r.Header.Get("X-Admin-Key"), "")
+	_ = s.db.RecordAudit("key_updated", types.MaskAPIKey(key), types.MaskAPIKey(r.Header.Get("X-Admin-Key")), "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -1218,7 +1218,7 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 	if s.auth != nil {
 		s.auth.InvalidateKeyCache(key)
 	}
-	_ = s.db.RecordAudit("key_deleted", key, r.Header.Get("X-Admin-Key"), "")
+	_ = s.db.RecordAudit("key_deleted", types.MaskAPIKey(key), types.MaskAPIKey(r.Header.Get("X-Admin-Key")), "")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
