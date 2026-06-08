@@ -39,6 +39,7 @@ var migrations = []string{
 	`ALTER TABLE request_stats ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0;`,
 	`ALTER TABLE request_stats ADD COLUMN error_reason TEXT;`,
 	`ALTER TABLE request_stats ADD COLUMN source TEXT;`,
+	`ALTER TABLE request_stats ADD COLUMN user_agent TEXT;`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_client_key ON request_stats(client_key);`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_client_created ON request_stats(client_key, created_at);`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_source ON request_stats(source);`,
@@ -201,9 +202,9 @@ func (d *DB) RecordStatBatch(records []types.StatRecord) error {
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO request_stats
-			(plan, provider, model, key_mask, client_key, source, request_tokens, response_tokens, total_tokens, status, status_code, error_reason, latency_ms, is_streaming, target_provider)
+			(plan, provider, model, key_mask, client_key, source, user_agent, request_tokens, response_tokens, total_tokens, status, status_code, error_reason, latency_ms, is_streaming, target_provider)
 		VALUES
-			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare batch stmt: %w", err)
@@ -216,7 +217,7 @@ func (d *DB) RecordStatBatch(records []types.StatRecord) error {
 			streaming = 1
 		}
 		if _, err := stmt.Exec(
-			r.Plan, r.Provider, r.Model, r.KeyMask, r.ClientKey, r.Source,
+			r.Plan, r.Provider, r.Model, r.KeyMask, r.ClientKey, r.Source, r.UserAgent,
 			r.RequestTokens, r.ResponseTokens, r.TotalTokens,
 			r.Status, r.StatusCode, r.ErrorReason, r.LatencyMs, streaming, r.TargetProvider,
 		); err != nil {
@@ -325,7 +326,7 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 		limit = maxLimit
 	}
 	query := `
-		SELECT plan, provider, model, key_mask, client_key, source, request_tokens, response_tokens, total_tokens, status, status_code, error_reason, latency_ms, is_streaming, target_provider
+		SELECT plan, provider, model, key_mask, client_key, source, user_agent, request_tokens, response_tokens, total_tokens, status, status_code, error_reason, latency_ms, is_streaming, target_provider
 		FROM request_stats
 		WHERE 1=1`
 	args := []any{}
@@ -353,6 +354,7 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 		var r types.StatRecord
 		var streaming int
 		var source sql.NullString
+		var userAgent sql.NullString
 		err := rows.Scan(
 			&r.Plan,
 			&r.Provider,
@@ -360,6 +362,7 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 			&r.KeyMask,
 			&r.ClientKey,
 			&source,
+			&userAgent,
 			&r.RequestTokens,
 			&r.ResponseTokens,
 			&r.TotalTokens,
@@ -375,6 +378,9 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 		}
 		if source.Valid {
 			r.Source = source.String
+		}
+		if userAgent.Valid {
+			r.UserAgent = userAgent.String
 		}
 		r.IsStreaming = streaming != 0
 		results = append(results, r)

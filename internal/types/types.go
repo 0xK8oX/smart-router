@@ -67,6 +67,7 @@ type StatRecord struct {
 	KeyMask        string `json:"key_mask,omitempty"`
 	ClientKey      string `json:"client_key,omitempty"`
 	Source         string `json:"source,omitempty"`
+	UserAgent      string `json:"user_agent,omitempty"`
 	RequestTokens  int    `json:"request_tokens"`
 	ResponseTokens int    `json:"response_tokens"`
 	TotalTokens    int    `json:"total_tokens"`
