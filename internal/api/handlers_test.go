@@ -728,7 +728,7 @@ func TestHandleKeyUsage(t *testing.T) {
 			Plan:           "default",
 			Provider:       "test",
 			Model:          "gpt-4",
-			ClientKey:      key.Key,
+			ClientKey:      types.MaskAPIKey(key.Key),
 			Status:         "success",
 			LatencyMs:      100,
 			RequestTokens:  10,

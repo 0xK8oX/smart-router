@@ -540,6 +540,8 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 	}
 
 	clientKey := ClientKeyFromContext(r.Context())
+	// Mask the client key for stat storage — store `****xxxx` not the raw key.
+	clientKeyMask := types.MaskAPIKey(clientKey)
 
 	// Model restriction check for authenticated requests
 	if apiKey := APIKeyFromContext(r.Context()); apiKey != nil && len(apiKey.Models) > 0 {
@@ -585,7 +587,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 		if provider.Format != clientFormat {
 			bodyReader = translation.SSETranslator(resp.Body, provider.Format, clientFormat)
 		}
-		s.proxyStream(r.Context(), w, bodyReader, planSlug, provider, start, clientFormat, clientKey, body, resp.StatusCode, r.Header.Get("User-Agent"))
+		s.proxyStream(r.Context(), w, bodyReader, planSlug, provider, start, clientFormat, clientKeyMask, body, resp.StatusCode, r.Header.Get("User-Agent"))
 		return
 	}
 
@@ -613,7 +615,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 	w.Header().Del("Content-Length")
 
 	latencyMs := time.Since(start).Milliseconds()
-	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat, clientKey, body, resp.StatusCode, r.Header.Get("User-Agent"))
+	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat, clientKeyMask, body, resp.StatusCode, r.Header.Get("User-Agent"))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)

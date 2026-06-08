@@ -40,6 +40,8 @@ var migrations = []string{
 	`ALTER TABLE request_stats ADD COLUMN error_reason TEXT;`,
 	`ALTER TABLE request_stats ADD COLUMN source TEXT;`,
 	`ALTER TABLE request_stats ADD COLUMN user_agent TEXT;`,
+	// client_key column stores the MASKED form (e.g. "****abcd"), not the
+	// raw API key. Despite the column name, all INSERTs apply MaskAPIKey.
 	`CREATE INDEX IF NOT EXISTS idx_stats_client_key ON request_stats(client_key);`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_client_created ON request_stats(client_key, created_at);`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_source ON request_stats(source);`,
@@ -990,7 +992,7 @@ func (d *DB) GetGroupMonthlyUsage(groupID int64, year, month int) (*MonthlyUsage
 	err := d.conn.QueryRow(`
 		SELECT COALESCE(SUM(request_tokens), 0), COALESCE(SUM(response_tokens), 0), COALESCE(COUNT(*), 0)
 		FROM request_stats
-		WHERE client_key IN (SELECT key FROM api_keys WHERE group_id = ?)
+		WHERE client_key IN (SELECT '****' || substr(key, -4) FROM api_keys WHERE group_id = ?)
 			AND created_at >= ? AND created_at < ? AND status = 'success'
 	`, groupID, start.UnixMilli(), end.UnixMilli()).Scan(&reqTokens, &respTokens, &reqCount)
 	if err != nil {
@@ -1019,7 +1021,7 @@ func (d *DB) GetKeyUsageSince(key string, since time.Time) (*WeeklyUsage, error)
 		SELECT COALESCE(SUM(request_tokens), 0), COALESCE(SUM(response_tokens), 0), COALESCE(COUNT(*), 0)
 		FROM request_stats
 		WHERE client_key = ? AND created_at > ? AND status = 'success'
-	`, key, since.UnixMilli()).Scan(&reqTokens, &respTokens, &reqCount)
+	`, types.MaskAPIKey(key), since.UnixMilli()).Scan(&reqTokens, &respTokens, &reqCount)
 	if err != nil {
 		return nil, fmt.Errorf("query key usage: %w", err)
 	}
@@ -1038,7 +1040,7 @@ func (d *DB) GetKeyMonthlyUsage(key string, year, month int) (*MonthlyUsage, err
 		SELECT COALESCE(SUM(request_tokens), 0), COALESCE(SUM(response_tokens), 0), COALESCE(COUNT(*), 0)
 		FROM request_stats
 		WHERE client_key = ? AND created_at >= ? AND created_at < ? AND status = 'success'
-	`, key, start.UnixMilli(), end.UnixMilli()).Scan(&reqTokens, &respTokens, &reqCount)
+	`, types.MaskAPIKey(key), start.UnixMilli(), end.UnixMilli()).Scan(&reqTokens, &respTokens, &reqCount)
 	if err != nil {
 		return nil, fmt.Errorf("query monthly usage: %w", err)
 	}
@@ -1180,7 +1182,7 @@ func (d *DB) GetKeyMonthlyCost(key string, year, month int) (float64, error) {
 		SELECT model, request_tokens, response_tokens
 		FROM request_stats
 		WHERE client_key = ? AND created_at >= ? AND created_at < ? AND status = 'success'
-	`, key, start.UnixMilli(), end.UnixMilli())
+	`, types.MaskAPIKey(key), start.UnixMilli(), end.UnixMilli())
 	if err != nil {
 		return 0, fmt.Errorf("query stats for cost: %w", err)
 	}
