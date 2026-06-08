@@ -1628,3 +1628,80 @@ func TestRouteTokenLimit(t *testing.T) {
 		t.Fatalf("expected 'too large' error, got: %v", err)
 	}
 }
+
+
+func TestRouteAdaptiveStrategy(t *testing.T) {
+	fastServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"fast","object":"chat.completion","choices":[]}`))
+	}))
+	defer fastServer.Close()
+
+	slowServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"slow","object":"chat.completion","choices":[]}`))
+	}))
+	defer slowServer.Close()
+
+	sqlitePath := "/tmp/test_router_adaptive.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-adaptive-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, _ := db.Open(sqlitePath)
+	defer database.Close()
+	ht, _ := health.New(badgerDir)
+	defer ht.Close()
+
+	plan := types.PlanConfig{
+		Strategy: "adaptive",
+		Providers: []types.ProviderConfig{
+			{Name: "slow", Model: "gpt-4", BaseURL: slowServer.URL, Format: "openai", APIKey: "sk-slow", Timeout: 30},
+			{Name: "fast", Model: "gpt-4", BaseURL: fastServer.URL, Format: "openai", APIKey: "sk-fast", Timeout: 30},
+		},
+	}
+	if err := database.SavePlan("adaptive-plan", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+
+	// Seed latency cache: fast=100ms, slow=5000ms.
+	router.recordLatency("fast", 100)
+	router.recordLatency("slow", 5000)
+
+	body := map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	}
+
+	// With adaptive scoring, the first request should go to the fast provider.
+	resp, provider, err := router.Route(context.Background(), "adaptive-plan", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if provider.Name != "fast" {
+		t.Errorf("expected first request to fast provider, got %s", provider.Name)
+	}
+	resp.Body.Close()
+
+	// Run many requests; fast should dominate due to lower latency.
+	fastCount := 0
+	for i := 0; i < 20; i++ {
+		resp, provider, err := router.Route(context.Background(), "adaptive-plan", body, false, "openai", nil, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if provider.Name == "fast" {
+			fastCount++
+		}
+		resp.Body.Close()
+	}
+
+	if fastCount < 10 {
+		t.Errorf("expected fast provider to dominate, but got %d/20", fastCount)
+	}
+}

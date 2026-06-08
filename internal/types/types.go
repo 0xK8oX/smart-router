@@ -12,6 +12,7 @@ type ProviderConfig struct {
 	WeeklyReqLimit    *uint64 `json:"weekly_request_limit,omitempty" yaml:"weekly_request_limit,omitempty"`
 	ContextLength     *int    `json:"context_length,omitempty" yaml:"context_length,omitempty"`
 	MaxOutputTokens   *int    `json:"max_output_tokens,omitempty" yaml:"max_output_tokens,omitempty"`
+	MaxConcurrency    *int    `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty"`
 	Weight            int     `json:"weight,omitempty" yaml:"weight,omitempty"`
 }
 

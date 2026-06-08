@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"smart-router/internal/db"
@@ -35,6 +36,10 @@ type Router struct {
 	planCache      map[string]cachedPlan
 	cacheTTL       time.Duration
 	mu             sync.RWMutex
+
+	// Adaptive routing state.
+	inFlight     map[string]*atomic.Int32
+	latencyCache map[string]int64
 }
 
 func New(tracker *health.HealthTracker, database *db.DB) *Router {
@@ -47,6 +52,8 @@ func New(tracker *health.HealthTracker, database *db.DB) *Router {
 		lastUsed:       make(map[string]time.Time),
 		planCache:      make(map[string]cachedPlan),
 		cacheTTL:       30 * time.Second,
+		inFlight:       make(map[string]*atomic.Int32),
+		latencyCache:   make(map[string]int64),
 	}
 }
 
@@ -259,6 +266,74 @@ func extractPlanFromURL(baseURL string) string {
 }
 
 // Route finds a healthy provider, calls it, and returns the response.
+// getInFlight returns the atomic counter for a provider, lazily initialising if needed.
+func (r *Router) getInFlight(name string) *atomic.Int32 {
+	r.mu.RLock()
+	v, ok := r.inFlight[name]
+	r.mu.RUnlock()
+	if ok {
+		return v
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if v, ok = r.inFlight[name]; ok {
+		return v
+	}
+	v = new(atomic.Int32)
+	r.inFlight[name] = v
+	return v
+}
+
+// recordLatency updates the EWMA latency cache for a provider.
+func (r *Router) recordLatency(provider string, latencyMs int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	const alpha = 0.3
+	old := r.latencyCache[provider]
+	if old == 0 {
+		r.latencyCache[provider] = latencyMs
+	} else {
+		r.latencyCache[provider] = int64(alpha*float64(latencyMs) + (1-alpha)*float64(old))
+	}
+}
+
+// getLatency returns the cached EWMA latency for a provider, or a default if unknown.
+func (r *Router) getLatency(provider string) int64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if v := r.latencyCache[provider]; v > 0 {
+		return v
+	}
+	return 10000 // default 10s when unknown
+}
+
+// providerScore returns a lower-is-better score for adaptive routing.
+// Factors: latency, in-flight ratio, same-model bonus.
+func (r *Router) providerScore(p types.ProviderConfig, requestedModel string) float64 {
+	score := float64(r.getLatency(p.Name))
+
+	// In-flight penalty. Providers with higher max_concurrency can absorb more load.
+	inFlight := r.getInFlight(p.Name).Load()
+	maxConc := int32(30)
+	if p.MaxConcurrency != nil && *p.MaxConcurrency > 0 {
+		maxConc = int32(*p.MaxConcurrency)
+	}
+	if inFlight >= maxConc {
+		score *= 1000.0
+	} else {
+		// Penalty is normalized against max_concurrency so providers
+		// with higher capacity don't get unfairly penalized.
+		score *= 1.0 + float64(inFlight)/float64(maxConc)
+	}
+
+	// Same-model bonus (preserves prompt cache for same-model providers).
+	if p.Model == requestedModel {
+		score *= 0.7
+	}
+
+	return score
+}
+
 func (r *Router) Route(ctx context.Context, planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, clientKey string) (*http.Response, types.ProviderConfig, error) {
 	return r.routeWithDepth(ctx, planSlug, body, isStreaming, clientFormat, headers, 0, clientKey, nil)
 }
@@ -337,25 +412,33 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 
 	requestedModel, _ := body["model"].(string)
 
-	// Build ordered provider list: matching model first, then rest in plan order.
-	var orderedProviders []types.ProviderConfig
-	var remaining []types.ProviderConfig
-	for _, p := range plan.Providers {
-		if p.Model == requestedModel {
-			orderedProviders = append(orderedProviders, p)
-		} else {
-			remaining = append(remaining, p)
-		}
-	}
-	// Apply load balancing strategy to non-matching providers.
-	remaining = r.applyStrategy(planSlug, plan.Strategy, remaining)
-	orderedProviders = append(orderedProviders, remaining...)
-
 	var providerErrors []string
 	now := time.Now().Unix()
 
 	// Pre-flight token count — computed once, checked against each provider's limit.
 	tokCount := CountRequestTokens(body)
+
+	// Build ordered provider list.
+	var orderedProviders []types.ProviderConfig
+	if plan.Strategy == "adaptive" {
+		orderedProviders = make([]types.ProviderConfig, len(plan.Providers))
+		copy(orderedProviders, plan.Providers)
+		sort.Slice(orderedProviders, func(i, j int) bool {
+			return r.providerScore(orderedProviders[i], requestedModel) <
+				r.providerScore(orderedProviders[j], requestedModel)
+		})
+	} else {
+		var remaining []types.ProviderConfig
+		for _, p := range plan.Providers {
+			if p.Model == requestedModel {
+				orderedProviders = append(orderedProviders, p)
+			} else {
+				remaining = append(remaining, p)
+			}
+		}
+		remaining = r.applyStrategy(planSlug, plan.Strategy, remaining)
+		orderedProviders = append(orderedProviders, remaining...)
+	}
 
 	for _, provider := range orderedProviders {
 		// Virtual provider: route internally to another plan instead of making an HTTP call.
@@ -429,6 +512,8 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			continue
 		}
 
+		// Track in-flight requests for adaptive routing.
+		r.getInFlight(provider.Name).Add(1)
 		start := time.Now()
 
 		var resp *http.Response
@@ -452,10 +537,12 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 		} else {
 			resp, err = r.client.Call(ctx, provider, translatedBody, fwdHeaders)
 		}
+		latencyMs := time.Since(start).Milliseconds()
+		r.getInFlight(provider.Name).Add(-1)
+		r.recordLatency(provider.Name, latencyMs)
 
 		if err != nil {
 			// Network / timeout error
-			latencyMs := time.Since(start).Milliseconds()
 			log.Printf("[ROUTER] FAILURE: plan=%s provider=%s error=%v latency=%dms", planSlug, provider.Name, err, latencyMs)
 			_ = r.healthTracker.RecordFailure(provider.Name, 0, err.Error())
 			r.db.RecordStatAsync(types.StatRecord{
@@ -491,7 +578,7 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			resp.Body.Close()
 		}
 
-		latencyMs := time.Since(start).Milliseconds()
+		latencyMs = time.Since(start).Milliseconds()
 		log.Printf("[ROUTER] FAILURE: plan=%s provider=%s status=%d latency=%dms body=%s", planSlug, provider.Name, resp.StatusCode, latencyMs, errBody)
 		_ = r.healthTracker.RecordFailure(provider.Name, resp.StatusCode, errBody)
 		r.db.RecordStatAsync(types.StatRecord{
