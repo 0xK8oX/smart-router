@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -50,6 +51,7 @@ func NewServer(r *router.Router, h *health.HealthTracker, d *db.DB, a *Auth, adm
 func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/v1/chat/completions", s.handleChatCompletions).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/messages", s.handleMessages).Methods(http.MethodPost, http.MethodOptions)
+	r.HandleFunc("/v1/messages/count_tokens", s.handleCountTokens).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/models", s.handleListModels).Methods(http.MethodGet, http.MethodOptions)
 	r.HandleFunc("/v1/models/{id}", s.handleGetModel).Methods(http.MethodGet, http.MethodOptions)
 	r.HandleFunc("/v1/plans", s.handleListPlans).Methods(http.MethodGet, http.MethodOptions)
@@ -58,6 +60,7 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/v1/plans/{slug}", s.handleDeletePlan).Methods(http.MethodDelete, http.MethodOptions)
 	r.HandleFunc("/v1/health", s.handleHealth).Methods(http.MethodGet, http.MethodOptions)
 	r.HandleFunc("/v1/health/activity", s.handleHealthActivity).Methods(http.MethodGet, http.MethodOptions)
+	r.HandleFunc("/v1/health/reset", s.handleHealthReset).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/stats", s.handleStats).Methods(http.MethodGet, http.MethodOptions)
 	r.HandleFunc("/v1/stats/aggregated", s.handleStatsAggregated).Methods(http.MethodGet, http.MethodOptions)
 
@@ -290,7 +293,7 @@ func fallbackCount(reqBody map[string]interface{}, respData []byte, format strin
 	return
 }
 
-func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig, latencyMs int64, isStreaming bool, data []byte, clientFormat string, clientKey string, reqBody map[string]interface{}) {
+func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig, latencyMs int64, isStreaming bool, data []byte, clientFormat string, clientKey string, reqBody map[string]interface{}, statusCode int) {
 	reqTokens, respTokens := 0, 0
 	if len(data) > 0 {
 		reqTokens, respTokens = extractUsage(data, clientFormat)
@@ -308,6 +311,7 @@ func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig
 		ResponseTokens: respTokens,
 		TotalTokens:    reqTokens + respTokens,
 		Status:         "success",
+		StatusCode:     statusCode,
 		LatencyMs:      latencyMs,
 		IsStreaming:    isStreaming,
 	})
@@ -321,7 +325,29 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	}
 }
 
-func writeError(w http.ResponseWriter, status int, message string) {
+// writeError writes an error response in the format expected by the client.
+// Anthropic clients (/v1/messages, /v1/models) get Anthropic-shaped errors;
+// OpenAI clients (/v1/chat/completions) get OpenAI-shaped errors.
+func writeError(w http.ResponseWriter, r *http.Request, status int, message string) {
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") || strings.HasPrefix(r.URL.Path, "/v1/models") {
+		errType := "api_error"
+		switch status {
+		case http.StatusBadRequest:
+			errType = "invalid_request_error"
+		case http.StatusTooManyRequests:
+			errType = "rate_limit_error"
+		case http.StatusForbidden:
+			errType = "authentication_error"
+		}
+		writeJSON(w, status, map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"type":    errType,
+				"message": message,
+			},
+		})
+		return
+	}
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
@@ -366,7 +392,7 @@ var streamBufPool = sync.Pool{
 	},
 }
 
-func (s *Server) proxyStream(ctx context.Context, w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string, clientKey string, reqBody map[string]interface{}) {
+func (s *Server) proxyStream(ctx context.Context, w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string, clientKey string, reqBody map[string]interface{}, statusCode int) {
 	if closer, ok := bodyReader.(io.Closer); ok {
 		defer closer.Close()
 	}
@@ -395,6 +421,7 @@ func (s *Server) proxyStream(ctx context.Context, w http.ResponseWriter, bodyRea
 			ResponseTokens: respTokens,
 			TotalTokens:    reqTokens + respTokens,
 			Status:         status,
+			StatusCode:     statusCode,
 			LatencyMs:      latencyMs,
 			IsStreaming:    true,
 		})
@@ -472,7 +499,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 	body := make(map[string]interface{})
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 
@@ -520,14 +547,14 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 			}
 		}
 		if !allowed {
-			writeError(w, http.StatusForbidden, "model not allowed for this key")
+			writeError(w, r, http.StatusForbidden, "model not allowed for this key")
 			return
 		}
 	}
 
 	resp, provider, err := s.router.Route(r.Context(), planSlug, body, isStreaming, clientFormat, r.Header, clientKey)
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
+		writeError(w, r, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -553,18 +580,18 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 		if provider.Format != clientFormat {
 			bodyReader = translation.SSETranslator(resp.Body, provider.Format, clientFormat)
 		}
-		s.proxyStream(r.Context(), w, bodyReader, planSlug, provider, start, clientFormat, clientKey, body)
+		s.proxyStream(r.Context(), w, bodyReader, planSlug, provider, start, clientFormat, clientKey, body, resp.StatusCode)
 		return
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize+1))
 	if err != nil {
 		log.Printf("read response body error: %v", err)
-		writeError(w, http.StatusInternalServerError, "failed to read response")
+		writeError(w, r, http.StatusInternalServerError, "failed to read response")
 		return
 	}
 	if int64(len(data)) > maxResponseBodySize {
-		writeError(w, http.StatusInternalServerError, "response body too large")
+		writeError(w, r, http.StatusInternalServerError, "response body too large")
 		return
 	}
 
@@ -581,7 +608,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 	w.Header().Del("Content-Length")
 
 	latencyMs := time.Since(start).Milliseconds()
-	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat, clientKey, body)
+	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat, clientKey, body, resp.StatusCode)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
@@ -598,18 +625,41 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.handleCompletion(w, r, "anthropic")
 }
 
+// handleCountTokens mirrors Anthropic's /v1/messages/count_tokens endpoint.
+// It counts tokens in the request body without making an upstream call.
+func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	tokens := router.CountRequestTokens(body)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"input_tokens": tokens,
+	})
+}
+
 // Static model list for Anthropic-compatible clients (Claude Code, etc.)
+// context_window and max_output_tokens are critical — Claude Code uses them
+// to decide when to compact and how to plan tool usage.
 var defaultModels = []map[string]interface{}{
-	{"type": "model", "id": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6", "created_at": "2026-04-01T00:00:00Z"},
-	{"type": "model", "id": "claude-opus-4-6", "display_name": "Claude Opus 4.6", "created_at": "2026-04-01T00:00:00Z"},
-	{"type": "model", "id": "k2p6", "display_name": "Kimi K2.6", "created_at": "2026-04-01T00:00:00Z"},
-	{"type": "model", "id": "auto-jason", "display_name": "Auto Jason", "created_at": "2026-04-01T00:00:00Z"},
-	{"type": "model", "id": "auto-sam", "display_name": "Auto Sam", "created_at": "2026-04-01T00:00:00Z"},
-	{"type": "model", "id": "auto-default", "display_name": "Auto Default", "created_at": "2026-04-01T00:00:00Z"},
-	{"type": "model", "id": "auto-coding", "display_name": "Auto Coding", "created_at": "2026-04-01T00:00:00Z"},
-	{"type": "model", "id": "auto-compact", "display_name": "Auto Compact", "created_at": "2026-04-01T00:00:00Z"},
-	{"type": "model", "id": "auto-chat2api", "display_name": "Auto Chat2API", "created_at": "2026-04-01T00:00:00Z"},
-	{"type": "model", "id": "auto-kato", "display_name": "Auto Kato", "created_at": "2026-04-01T00:00:00Z"},
+	{"type": "model", "id": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6", "created_at": "2026-04-01T00:00:00Z", "context_window": 200000, "max_output_tokens": 8192},
+	{"type": "model", "id": "claude-opus-4-6", "display_name": "Claude Opus 4.6", "created_at": "2026-04-01T00:00:00Z", "context_window": 200000, "max_output_tokens": 16384},
+	{"type": "model", "id": "k2p6", "display_name": "Kimi K2.6", "created_at": "2026-04-01T00:00:00Z", "context_window": 262144, "max_output_tokens": 98304},
+	{"type": "model", "id": "auto-jason", "display_name": "Auto Jason", "created_at": "2026-04-01T00:00:00Z", "context_window": 262144, "max_output_tokens": 98304},
+	{"type": "model", "id": "auto-sam", "display_name": "Auto Sam", "created_at": "2026-04-01T00:00:00Z", "context_window": 262144, "max_output_tokens": 98304},
+	{"type": "model", "id": "auto-default", "display_name": "Auto Default", "created_at": "2026-04-01T00:00:00Z", "context_window": 262144, "max_output_tokens": 98304},
+	{"type": "model", "id": "auto-coding", "display_name": "Auto Coding", "created_at": "2026-04-01T00:00:00Z", "context_window": 262144, "max_output_tokens": 98304},
+	{"type": "model", "id": "auto-compact", "display_name": "Auto Compact", "created_at": "2026-04-01T00:00:00Z", "context_window": 262144, "max_output_tokens": 98304},
+	{"type": "model", "id": "auto-chat2api", "display_name": "Auto Chat2API", "created_at": "2026-04-01T00:00:00Z", "context_window": 262144, "max_output_tokens": 98304},
+	{"type": "model", "id": "auto-kato", "display_name": "Auto Kato", "created_at": "2026-04-01T00:00:00Z", "context_window": 262144, "max_output_tokens": 98304},
 }
 
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
@@ -638,7 +688,7 @@ func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeError(w, http.StatusNotFound, "model not found")
+	writeError(w, r, http.StatusNotFound, "model not found")
 }
 
 func (s *Server) handleListPlans(w http.ResponseWriter, r *http.Request) {
@@ -649,7 +699,7 @@ func (s *Server) handleListPlans(w http.ResponseWriter, r *http.Request) {
 
 	plans, err := s.db.ListPlans()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -670,7 +720,7 @@ func (s *Server) handleGetPlan(w http.ResponseWriter, r *http.Request) {
 	slug := mux.Vars(r)["slug"]
 	plan, err := s.db.GetPlan(slug)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, r, http.StatusNotFound, err.Error())
 		return
 	}
 
@@ -696,18 +746,18 @@ func (s *Server) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {
 	slug := mux.Vars(r)["slug"]
 	existing, err := s.db.GetPlan(slug)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "plan not found")
+		writeError(w, r, http.StatusNotFound, "plan not found")
 		return
 	}
 	// Start from existing record so omitted fields are preserved.
 	plan := *existing
 	if err := json.NewDecoder(r.Body).Decode(&plan); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 
 	if err := s.db.SavePlan(slug, plan); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.router.InvalidatePlanCache(slug)
@@ -727,7 +777,7 @@ func (s *Server) handleDeletePlan(w http.ResponseWriter, r *http.Request) {
 
 	slug := mux.Vars(r)["slug"]
 	if err := s.db.DeletePlan(slug); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.router.InvalidatePlanCache(slug)
@@ -747,7 +797,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if planSlug != "" {
 		plan, err := s.db.GetPlan(planSlug)
 		if err != nil {
-			writeError(w, http.StatusNotFound, err.Error())
+			writeError(w, r, http.StatusNotFound, err.Error())
 			return
 		}
 		for _, p := range plan.Providers {
@@ -771,7 +821,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		// we list all plans and collect their providers
 		plans, err := s.db.ListPlans()
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
+			writeError(w, r, http.StatusInternalServerError, err.Error())
 			return
 		}
 		seen := make(map[string]bool)
@@ -801,7 +851,7 @@ func (s *Server) handleHealthActivity(w http.ResponseWriter, r *http.Request) {
 
 	plans, err := s.db.ListPlans()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -842,6 +892,60 @@ func (s *Server) handleHealthActivity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, activities)
 }
 
+func (s *Server) handleHealthReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if !s.requireAdmin(w, r) {
+		return
+	}
+
+	var body struct {
+		Provider string `json:"provider"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	if body.Provider == "" {
+		// Reset all unhealthy providers
+		all, err := s.health.List()
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "list health: "+err.Error())
+			return
+		}
+		var reset []string
+		for name, h := range all {
+			if h.Status == "unhealthy" {
+				if err := s.health.ResetProvider(name); err != nil {
+					writeError(w, r, http.StatusInternalServerError, "reset "+name+": "+err.Error())
+					return
+				}
+				reset = append(reset, name)
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"reset":   reset,
+			"count":   len(reset),
+			"message": fmt.Sprintf("reset %d unhealthy provider(s)", len(reset)),
+		})
+		return
+	}
+
+	// Reset specific provider
+	if err := s.health.ResetProvider(body.Provider); err != nil {
+		writeError(w, r, http.StatusInternalServerError, "reset "+body.Provider+": "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"reset":   []string{body.Provider},
+		"count":   1,
+		"message": body.Provider + " reset to healthy",
+	})
+}
+
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
@@ -863,7 +967,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := s.db.GetStats(plan, provider, limit)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -886,7 +990,7 @@ func (s *Server) handleStatsAggregated(w http.ResponseWriter, r *http.Request) {
 
 	stats, err := s.db.GetStats("", "", 0)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -966,11 +1070,11 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 		clientIP = r.RemoteAddr
 	}
 	if ok, _ := s.adminRateLimiter.Allow("admin:"+clientIP, 30, 1000); !ok {
-		writeError(w, http.StatusTooManyRequests, "admin rate limit exceeded")
+		writeError(w, r, http.StatusTooManyRequests, "admin rate limit exceeded")
 		return false
 	}
 	if !adminKeyValid(r.Header.Get("X-Admin-Key"), s.adminKey) {
-		writeError(w, http.StatusForbidden, "invalid admin key")
+		writeError(w, r, http.StatusForbidden, "invalid admin key")
 		return false
 	}
 	return true
@@ -986,13 +1090,13 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	}
 	var req types.APIKey
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 	req.Key = auth.GenerateAPIKey()
 	req.CreatedAt = time.Now().Unix()
 	if err := s.db.CreateAPIKey(req); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	_ = s.db.RecordAudit("key_created", req.Key, r.Header.Get("X-Admin-Key"), "")
@@ -1009,7 +1113,7 @@ func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	keys, err := s.db.ListAPIKeys()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	// Mask key values in listing
@@ -1030,7 +1134,7 @@ func (s *Server) handleGetKey(w http.ResponseWriter, r *http.Request) {
 	key := mux.Vars(r)["key"]
 	k, err := s.db.GetAPIKey(key)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, r, http.StatusNotFound, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, k)
@@ -1047,22 +1151,22 @@ func (s *Server) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
 	key := mux.Vars(r)["key"]
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read body")
+		writeError(w, r, http.StatusBadRequest, "failed to read body")
 		return
 	}
 	if !json.Valid(bodyBytes) {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 	existing, err := s.db.GetAPIKey(key)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "key not found")
+		writeError(w, r, http.StatusNotFound, "key not found")
 		return
 	}
 	// Start from existing record so omitted fields are preserved.
 	k := *existing
 	if err := json.Unmarshal(bodyBytes, &k); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 	// Preserve the original key identifier and server-managed timestamps.
@@ -1070,7 +1174,7 @@ func (s *Server) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
 	k.CreatedAt = existing.CreatedAt
 	k.LastUsedAt = existing.LastUsedAt
 	if err := s.db.UpdateAPIKey(key, k); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if s.auth != nil {
@@ -1090,7 +1194,7 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 	}
 	key := mux.Vars(r)["key"]
 	if err := s.db.DeleteAPIKey(key); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if s.auth != nil {
@@ -1112,12 +1216,12 @@ func (s *Server) handleKeyUsage(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	monthly, err := s.db.GetKeyMonthlyUsage(key, now.Year(), int(now.Month()))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	weekly, err := s.db.GetKeyUsageSince(key, now.Add(-7*24*time.Hour))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	cost, _ := s.db.GetKeyMonthlyCost(key, now.Year(), int(now.Month()))
@@ -1145,7 +1249,7 @@ func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	logs, err := s.db.ListAuditLogs(limit)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, logs)
@@ -1176,11 +1280,11 @@ func (s *Server) handleSetPricing(w http.ResponseWriter, r *http.Request) {
 		OutputPrice float64 `json:"output_price_per_1k"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 	if err := s.db.SetModelPricing(model, req.InputPrice, req.OutputPrice); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -1196,7 +1300,7 @@ func (s *Server) handleListGroups(w http.ResponseWriter, r *http.Request) {
 	}
 	groups, err := s.db.ListKeyGroups()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, groups)
@@ -1212,12 +1316,12 @@ func (s *Server) handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	var req types.KeyGroup
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 	id, err := s.db.CreateKeyGroup(req)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"id": id})
@@ -1234,12 +1338,12 @@ func (s *Server) handleGetGroup(w http.ResponseWriter, r *http.Request) {
 	idStr := mux.Vars(r)["id"]
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid group id")
+		writeError(w, r, http.StatusBadRequest, "invalid group id")
 		return
 	}
 	g, err := s.db.GetKeyGroup(id)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, r, http.StatusNotFound, err.Error())
 		return
 	}
 	now := time.Now().UTC()
@@ -1261,31 +1365,31 @@ func (s *Server) handleUpdateGroup(w http.ResponseWriter, r *http.Request) {
 	idStr := mux.Vars(r)["id"]
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid group id")
+		writeError(w, r, http.StatusBadRequest, "invalid group id")
 		return
 	}
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read body")
+		writeError(w, r, http.StatusBadRequest, "failed to read body")
 		return
 	}
 	if !json.Valid(bodyBytes) {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 	g, err := s.db.GetKeyGroup(id)
 	if err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		writeError(w, r, http.StatusNotFound, err.Error())
 		return
 	}
 	// Start from existing record so omitted fields are preserved.
 	updated := *g
 	if err := json.Unmarshal(bodyBytes, &updated); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
 	if err := s.db.UpdateKeyGroup(id, updated); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if s.auth != nil {
@@ -1305,11 +1409,11 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 	idStr := mux.Vars(r)["id"]
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid group id")
+		writeError(w, r, http.StatusBadRequest, "invalid group id")
 		return
 	}
 	if err := s.db.DeleteKeyGroup(id); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if s.auth != nil {

@@ -140,24 +140,24 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 			token = r.Header.Get("x-api-key")
 		}
 		if token == "" {
-			writeError(w, http.StatusUnauthorized, "missing Authorization header")
+			writeError(w, r, http.StatusUnauthorized, "missing Authorization header")
 			return
 		}
 
 		apiKey, err := a.getKeyCached(token)
 		if err != nil {
-			writeError(w, http.StatusUnauthorized, "invalid api key")
+			writeError(w, r, http.StatusUnauthorized, "invalid api key")
 			return
 		}
 
 		if apiKey.Disabled {
-			writeError(w, http.StatusUnauthorized, "api key disabled")
+			writeError(w, r, http.StatusUnauthorized, "api key disabled")
 			return
 		}
 
 		if apiKey.ExpiresAt != nil && *apiKey.ExpiresAt < time.Now().Unix() {
 			alerts.SendWebhookExpiredAlert(apiKey.WebhookURL, apiKey.Name)
-			writeError(w, http.StatusUnauthorized, "api key expired")
+			writeError(w, r, http.StatusUnauthorized, "api key expired")
 			return
 		}
 
@@ -168,14 +168,14 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 				clientIP = r.RemoteAddr
 			}
 			if !isIPAllowed(clientIP, apiKey.AllowedIPs) {
-				writeError(w, http.StatusForbidden, "client ip not allowed")
+				writeError(w, r, http.StatusForbidden, "client ip not allowed")
 				return
 			}
 		}
 
 		// Rate limit check — before body read so rejected requests pay no I/O cost
 		if ok, reason := a.rl.Allow(token, apiKey.RateLimitRPM, apiKey.RateLimitRPD); !ok {
-			writeError(w, http.StatusTooManyRequests, fmt.Sprintf("rate limit exceeded: %s", reason))
+			writeError(w, r, http.StatusTooManyRequests, fmt.Sprintf("rate limit exceeded: %s", reason))
 			return
 		}
 
@@ -184,15 +184,15 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 		if apiKey.MonthlyTokenLimit > 0 || apiKey.MonthlyRequestLimit > 0 {
 			usage, err := a.getUsageCached(token, now.Year(), int(now.Month()))
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, "failed to check quota")
+				writeError(w, r, http.StatusInternalServerError, "failed to check quota")
 				return
 			}
 			if apiKey.MonthlyTokenLimit > 0 && usage.RequestTokens+usage.ResponseTokens >= int64(apiKey.MonthlyTokenLimit) {
-				writeError(w, http.StatusTooManyRequests, "monthly token quota exceeded")
+				writeError(w, r, http.StatusTooManyRequests, "monthly token quota exceeded")
 				return
 			}
 			if apiKey.MonthlyRequestLimit > 0 && usage.RequestCount >= int64(apiKey.MonthlyRequestLimit) {
-				writeError(w, http.StatusTooManyRequests, "monthly request quota exceeded")
+				writeError(w, r, http.StatusTooManyRequests, "monthly request quota exceeded")
 				return
 			}
 
@@ -206,15 +206,15 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 			if err == nil && (group.MonthlyTokenLimit > 0 || group.MonthlyRequestLimit > 0) {
 				groupUsage, err := a.getGroupUsageCached(*apiKey.GroupID, now.UTC().Year(), int(now.UTC().Month()))
 				if err != nil {
-					writeError(w, http.StatusInternalServerError, "failed to check group quota")
+					writeError(w, r, http.StatusInternalServerError, "failed to check group quota")
 					return
 				}
 				if group.MonthlyTokenLimit > 0 && groupUsage.RequestTokens+groupUsage.ResponseTokens >= int64(group.MonthlyTokenLimit) {
-					writeError(w, http.StatusTooManyRequests, "group monthly token quota exceeded")
+					writeError(w, r, http.StatusTooManyRequests, "group monthly token quota exceeded")
 					return
 				}
 				if group.MonthlyRequestLimit > 0 && groupUsage.RequestCount >= int64(group.MonthlyRequestLimit) {
-					writeError(w, http.StatusTooManyRequests, "group monthly request quota exceeded")
+					writeError(w, r, http.StatusTooManyRequests, "group monthly request quota exceeded")
 					return
 				}
 			}
@@ -227,17 +227,17 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 		lr := io.LimitReader(r.Body, maxRequestBodySize+1)
 		bodyBytes, err := io.ReadAll(lr)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "failed to read body")
+			writeError(w, r, http.StatusBadRequest, "failed to read body")
 			return
 		}
 		if int64(len(bodyBytes)) > maxRequestBodySize {
-			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			writeError(w, r, http.StatusRequestEntityTooLarge, "request body too large")
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		var body map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &body); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			writeError(w, r, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
 		planSlug := resolvePlanFromBody(body)
@@ -255,7 +255,7 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 				}
 			}
 			if !allowed {
-				writeError(w, http.StatusForbidden, "plan not allowed for this key")
+				writeError(w, r, http.StatusForbidden, "plan not allowed for this key")
 				return
 			}
 		}

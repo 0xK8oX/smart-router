@@ -69,6 +69,8 @@ type StatRecord struct {
 	ResponseTokens int    `json:"response_tokens"`
 	TotalTokens    int    `json:"total_tokens"`
 	Status         string `json:"status"`
+	StatusCode     int    `json:"status_code"`
+	ErrorReason    string `json:"error_reason,omitempty"`
 	LatencyMs      int64  `json:"latency_ms"`
 	IsStreaming    bool   `json:"is_streaming"`
 	TargetProvider string `json:"target_provider,omitempty"`

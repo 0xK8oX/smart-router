@@ -15,13 +15,14 @@ var circuitRules = map[string]struct {
 	threshold int
 	cooldown  time.Duration
 }{
-	"auth":         {threshold: 1, cooldown: 1 * time.Hour},
-	"quota":        {threshold: 1, cooldown: 5 * time.Hour},
-	"rate_limit":   {threshold: 3, cooldown: 5 * time.Minute},
-	"server_error": {threshold: 2, cooldown: 2 * time.Minute},
-	"connection":   {threshold: 2, cooldown: 1 * time.Minute},
-	"timeout":      {threshold: 2, cooldown: 2 * time.Minute},
-	"unknown":      {threshold: 3, cooldown: 1 * time.Minute},
+	"auth":             {threshold: 1, cooldown: 1 * time.Hour},
+	"quota":            {threshold: 1, cooldown: 5 * time.Hour},
+	"rate_limit":       {threshold: 3, cooldown: 5 * time.Minute},
+	"server_error":     {threshold: 2, cooldown: 2 * time.Minute},
+	"connection":       {threshold: 2, cooldown: 1 * time.Minute},
+	"timeout":          {threshold: 2, cooldown: 2 * time.Minute},
+	"invalid_request":  {threshold: 50, cooldown: 5 * time.Minute},
+	"unknown":          {threshold: 3, cooldown: 1 * time.Minute},
 }
 
 type HealthTracker struct {
@@ -113,7 +114,11 @@ func (h *HealthTracker) RecordFailure(provider string, status int, message strin
 	h.mu.RUnlock()
 
 	now := time.Now().Unix()
-	reason := classifyFailure(status, message)
+	reason := ClassifyFailure(status, message)
+	// Client-side disconnects (e.g. context canceled) should not count as provider failures.
+	if reason == "" {
+		return nil
+	}
 	rule := circuitRules[reason]
 	if rule.threshold == 0 {
 		rule = circuitRules["unknown"]
@@ -131,6 +136,32 @@ func (h *HealthTracker) RecordFailure(provider string, status int, message strin
 		health.Status = "unhealthy"
 		health.CooldownUntil = now + int64(rule.cooldown.Seconds())
 	}
+
+	h.cache[provider] = health
+	h.dirty[provider] = true
+	h.mu.Unlock()
+	return nil
+}
+
+// ResetProvider clears the unhealthy state for a provider, setting it back
+// to healthy without requiring a successful HTTP call.
+func (h *HealthTracker) ResetProvider(provider string) error {
+	h.mu.RLock()
+	if h.closing {
+		h.mu.RUnlock()
+		return nil
+	}
+	h.mu.RUnlock()
+
+	now := time.Now().Unix()
+
+	h.mu.Lock()
+	health := h.cache[provider]
+	health.Status = "healthy"
+	health.ConsecutiveFailures = 0
+	health.CooldownUntil = 0
+	health.LastFailureReason = ""
+	health.LastActivityAt = now
 
 	h.cache[provider] = health
 	h.dirty[provider] = true
@@ -263,8 +294,49 @@ func (h *HealthTracker) flush() error {
 	return nil
 }
 
-func classifyFailure(status int, message string) string {
+// List returns all provider health records from the DB.
+func (h *HealthTracker) List() (map[string]types.ProviderHealth, error) {
+	result := make(map[string]types.ProviderHealth)
+
+	h.mu.RLock()
+	for name, health := range h.cache {
+		result[name] = health
+	}
+	h.mu.RUnlock()
+
+	err := h.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchSize = 10
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		prefix := []byte("health:")
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+			name := strings.TrimPrefix(string(item.Key()), "health:")
+			if _, ok := result[name]; ok {
+				continue // prefer cached version
+			}
+			var health types.ProviderHealth
+			if err := item.Value(func(val []byte) error {
+				return json.Unmarshal(val, &health)
+			}); err != nil {
+				log.Printf("[HEALTH] unmarshal failed for %s: %v", name, err)
+				continue
+			}
+			result[name] = health
+		}
+		return nil
+	})
+	return result, err
+}
+
+func ClassifyFailure(status int, message string) string {
 	msg := strings.ToLower(message)
+	// Client-side disconnects should not count as provider failures.
+	if strings.Contains(msg, "context canceled") {
+		return ""
+	}
 	if status == 401 || strings.Contains(msg, "authentication") || strings.Contains(msg, "unauthorized") {
 		return "auth"
 	}
@@ -274,13 +346,16 @@ func classifyFailure(status int, message string) string {
 	if status == 429 || strings.Contains(msg, "rate limit") {
 		return "rate_limit"
 	}
+	if status == 400 || status == 422 {
+		return "invalid_request"
+	}
 	if status >= 500 && status < 600 {
 		return "server_error"
 	}
 	if strings.Contains(msg, "connection") || strings.Contains(msg, "refused") {
 		return "connection"
 	}
-	if strings.Contains(msg, "timeout") {
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "context deadline exceeded") {
 		return "timeout"
 	}
 	return "unknown"

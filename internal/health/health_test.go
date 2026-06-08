@@ -43,13 +43,17 @@ func TestClassifyFailure(t *testing.T) {
 		{0, "connection reset", "connection"},
 		{0, "connection refused", "connection"},
 		{0, "request timeout", "timeout"},
+		{400, "invalid params", "invalid_request"},
+		{422, "unprocessable entity", "invalid_request"},
+		{0, "context canceled", ""},
+		{0, "context deadline exceeded", "timeout"},
 		{0, "something weird", "unknown"},
 	}
 
 	for _, tt := range tests {
-		got := classifyFailure(tt.status, tt.message)
+		got := ClassifyFailure(tt.status, tt.message)
 		if got != tt.want {
-			t.Errorf("classifyFailure(%d, %q) = %q, want %q", tt.status, tt.message, got, tt.want)
+			t.Errorf("ClassifyFailure(%d, %q) = %q, want %q", tt.status, tt.message, got, tt.want)
 		}
 	}
 }
@@ -175,5 +179,71 @@ func TestRecordSuccessResets(t *testing.T) {
 	}
 	if h.LastFailureReason != "" {
 		t.Errorf("expected LastFailureReason cleared, got %q", h.LastFailureReason)
+	}
+}
+
+func TestRecordFailureSkipsClientDisconnect(t *testing.T) {
+	ht, cleanup := setupTestHealth(t)
+	defer cleanup()
+
+	// Client-side disconnects (context canceled) should not count as provider failures.
+	err := ht.RecordFailure("openai", 0, "Post \"...\": context canceled")
+	if err != nil {
+		t.Fatalf("RecordFailure error: %v", err)
+	}
+
+	h, err := ht.GetHealth("openai")
+	if err != nil {
+		t.Fatalf("GetHealth error: %v", err)
+	}
+
+	if h.Status != "" {
+		t.Errorf("expected no status change for client disconnect, got %q", h.Status)
+	}
+	if h.ConsecutiveFailures != 0 {
+		t.Errorf("expected consecutiveFailures 0, got %d", h.ConsecutiveFailures)
+	}
+	if h.TotalRequests != 0 {
+		t.Errorf("expected totalRequests 0, got %d", h.TotalRequests)
+	}
+}
+
+func TestInvalidRequestThresholdIsHigher(t *testing.T) {
+	ht, cleanup := setupTestHealth(t)
+	defer cleanup()
+
+	// invalid_request threshold is 50 — record 49 times, should still be healthy.
+	for i := 0; i < 49; i++ {
+		err := ht.RecordFailure("openai", 400, "invalid params")
+		if err != nil {
+			t.Fatalf("RecordFailure error: %v", err)
+		}
+	}
+
+	h, err := ht.GetHealth("openai")
+	if err != nil {
+		t.Fatalf("GetHealth error: %v", err)
+	}
+
+	if h.Status != "" {
+		t.Errorf("expected status empty after 49 invalid_requests (threshold=50), got %q", h.Status)
+	}
+	if h.ConsecutiveFailures != 49 {
+		t.Errorf("expected consecutiveFailures 49, got %d", h.ConsecutiveFailures)
+	}
+
+	// 50th failure should trip the breaker.
+	err = ht.RecordFailure("openai", 400, "invalid params")
+	if err != nil {
+		t.Fatalf("RecordFailure error: %v", err)
+	}
+
+	h, err = ht.GetHealth("openai")
+	if err != nil {
+		t.Fatalf("GetHealth error: %v", err)
+	}
+
+	if h.Status != "unhealthy" {
+		t.Errorf("expected status unhealthy after 50 invalid_requests, got %q", h.Status)
 	}
 }

@@ -150,6 +150,8 @@ func (b *Bot) buildReply(text string) string {
 		return b.cmdKeyUsage(args)
 	case "/providers":
 		return b.cmdProviders()
+	case "/reset":
+		return b.cmdReset(args)
 	case "/help", "/start":
 		return b.cmdHelp()
 	default:
@@ -457,7 +459,13 @@ func (b *Bot) cmdProviders() string {
 				mask = "(no key)"
 			}
 
-			lines = append(lines, fmt.Sprintf("%s *%s* — `%s` model=%s format=%s", statusEmoji, p.Name, mask, p.Model, p.Format))
+			lat, _ := b.db.GetProviderLatencyStats(p.Name, time.Now().Add(-24*time.Hour))
+			latStr := ""
+			if lat != nil && lat.Count > 0 {
+				latStr = fmt.Sprintf(" | p50=%s p95=%s n=%d", formatLatency(lat.P50), formatLatency(lat.P95), lat.Count)
+			}
+
+			lines = append(lines, fmt.Sprintf("%s *%s* — `%s` model=%s format=%s%s", statusEmoji, p.Name, mask, p.Model, p.Format, latStr))
 		}
 	}
 
@@ -628,7 +636,19 @@ func (b *Bot) cmdHelp() string {
 /keys — List all API keys
 /key <key_or_name> — Show key details and usage
 /keyusage <key_or_name> [5h|1d|1w|30d|1m] — Usage for specific key
+/reset <provider> — Reset provider health to healthy (clear cooldown)
 /help — Show this message`
+}
+
+func (b *Bot) cmdReset(args []string) string {
+	if len(args) < 1 {
+		return "Usage: /reset <provider_name>"
+	}
+	name := args[0]
+	if err := b.health.ResetProvider(name); err != nil {
+		return fmt.Sprintf("Error resetting %s: %v", name, err)
+	}
+	return fmt.Sprintf("✅ *%s* health reset to healthy.", name)
 }
 
 func (b *Bot) cmdKeys() string {
@@ -794,6 +814,16 @@ func formatHealth(name string, h types.ProviderHealth) string {
 		lines = append(lines, fmt.Sprintf("Cooldown until: %s", time.Unix(h.CooldownUntil, 0).Format(time.RFC3339)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func formatLatency(ms int) string {
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	if ms < 60000 {
+		return fmt.Sprintf("%.1fs", float64(ms)/1000.0)
+	}
+	return fmt.Sprintf("%.0fs", float64(ms)/1000.0)
 }
 
 func formatHealthLine(name string, h types.ProviderHealth) string {

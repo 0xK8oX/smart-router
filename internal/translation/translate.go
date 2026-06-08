@@ -23,6 +23,11 @@ func TranslateRequest(body map[string]interface{}, sourceFormat, targetFormat st
 	}
 
 	if sourceFormat == targetFormat {
+		// Even in passthrough, sanitize messages for provider requirements.
+		if sourceFormat == "anthropic" {
+			stripUnsupportedFields(result)
+			ensureReasoningContent(result)
+		}
 		return result, nil
 	}
 
@@ -341,6 +346,73 @@ func stringify(v interface{}) string {
 		return fmt.Sprint(v)
 	}
 	return string(b)
+}
+
+// ensureReasoningContent adds an empty thinking block to assistant messages that have
+// tool_use blocks but no thinking block, when the request has thinking enabled.
+// Kimi and MiniMax require reasoning_content on every assistant tool-call message when thinking is on.
+func ensureReasoningContent(body map[string]interface{}) {
+	thinking, _ := body["thinking"].(map[string]interface{})
+	if thinking == nil {
+		return
+	}
+	ttype, _ := thinking["type"].(string)
+	if ttype != "enabled" && ttype != "adaptive" {
+		return
+	}
+
+	msgs, ok := body["messages"].([]interface{})
+	if !ok {
+		return
+	}
+
+	for _, m := range msgs {
+		msg, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "assistant" {
+			continue
+		}
+
+		content, ok := msg["content"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		hasToolUse := false
+		hasThinking := false
+		for _, c := range content {
+			block, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			t, _ := block["type"].(string)
+			if t == "tool_use" {
+				hasToolUse = true
+			}
+			if t == "thinking" {
+				hasThinking = true
+			}
+		}
+
+		if hasToolUse && !hasThinking {
+			newContent := make([]interface{}, 0, len(content)+1)
+			newContent = append(newContent, map[string]interface{}{
+				"type":     "thinking",
+				"thinking": "",
+			})
+			msg["content"] = append(newContent, content...)
+		}
+	}
+}
+
+// stripUnsupportedFields removes fields that upstream providers (Kimi, MiniMax, etc.)
+// don't recognize and would reject with "invalid params".
+func stripUnsupportedFields(body map[string]interface{}) {
+	delete(body, "context_management")
+	delete(body, "output_config")
+	delete(body, "metadata")
 }
 
 // TranslateResponse converts a non-streaming response body.

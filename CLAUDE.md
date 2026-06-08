@@ -127,6 +127,8 @@ After any handler, router, translation, or provider client changes: rebuild and 
 cd /Volumes/Proj/workspace/smart-router && go build -o smart-router . && pm2 restart smart-router
 ```
 
+**Critical: never chain `pm2 stop` with fallible commands.** A failed intermediate step (e.g., `go run ./cmd/reset/main.go` missing) leaves the service dead. Use `pm2 restart` or `pm2 reload` instead. For full safety, use `./scripts/safe-restart.sh` which builds first, then restarts atomically.
+
 ### Key Files
 
 | File | Responsibility |
@@ -138,6 +140,37 @@ cd /Volumes/Proj/workspace/smart-router && go build -o smart-router . && pm2 res
 | `internal/db/db.go` | SQLite: plans, stats, usage queries |
 | `internal/health/health.go` | BadgerDB: failure tracking, cooldown logic |
 | `internal/alerts/telegram.go` | Telegram bot commands |
+
+### Operations
+
+**Safe restart (preserves in-flight requests):**
+```bash
+./scripts/safe-restart.sh              # build first, then restart
+./scripts/safe-restart.sh --reset-all  # also reset unhealthy providers
+```
+The script builds a new binary atomically. If compilation fails, the running service is untouched.
+
+**Graceful shutdown timing:**
+- Go `srv.Shutdown` timeout: **120s** (`main.go`)
+- PM2 `kill_timeout`: **135s** (`ecosystem.config.js`)
+- Streaming requests can exceed 60s; PM2 must outlast Go's shutdown so `srv.Shutdown` completes before SIGKILL.
+
+**Reset provider health (online, no restart needed):**
+```bash
+# Specific provider
+curl -X POST http://localhost:8790/v1/health/reset \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: $SMART_ROUTER_ADMIN_KEY" \
+  -d '{"provider":"jason-kimi"}'
+
+# All unhealthy providers
+curl -X POST http://localhost:8790/v1/health/reset \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: $SMART_ROUTER_ADMIN_KEY" \
+  -d '{}'
+```
+
+Or via Telegram: `/reset <provider>`
 
 ### Common Pitfalls
 

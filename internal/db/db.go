@@ -36,6 +36,8 @@ var migrations = []string{
 	`ALTER TABLE request_stats ADD COLUMN client_key TEXT;`,
 	`ALTER TABLE request_stats ADD COLUMN key_mask TEXT;`,
 	`ALTER TABLE request_stats ADD COLUMN target_provider TEXT;`,
+	`ALTER TABLE request_stats ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0;`,
+	`ALTER TABLE request_stats ADD COLUMN error_reason TEXT;`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_client_key ON request_stats(client_key);`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_client_created ON request_stats(client_key, created_at);`,
 	`CREATE TABLE IF NOT EXISTS plans (
@@ -171,9 +173,9 @@ func (d *DB) RecordStatBatch(records []types.StatRecord) error {
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO request_stats
-			(plan, provider, model, key_mask, client_key, request_tokens, response_tokens, total_tokens, status, latency_ms, is_streaming, target_provider)
+			(plan, provider, model, key_mask, client_key, request_tokens, response_tokens, total_tokens, status, status_code, error_reason, latency_ms, is_streaming, target_provider)
 		VALUES
-			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare batch stmt: %w", err)
@@ -188,7 +190,7 @@ func (d *DB) RecordStatBatch(records []types.StatRecord) error {
 		if _, err := stmt.Exec(
 			r.Plan, r.Provider, r.Model, r.KeyMask, r.ClientKey,
 			r.RequestTokens, r.ResponseTokens, r.TotalTokens,
-			r.Status, r.LatencyMs, streaming, r.TargetProvider,
+			r.Status, r.StatusCode, r.ErrorReason, r.LatencyMs, streaming, r.TargetProvider,
 		); err != nil {
 			return fmt.Errorf("exec batch insert: %w", err)
 		}
@@ -295,7 +297,7 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 		limit = maxLimit
 	}
 	query := `
-		SELECT plan, provider, model, key_mask, client_key, request_tokens, response_tokens, total_tokens, status, latency_ms, is_streaming, target_provider
+		SELECT plan, provider, model, key_mask, client_key, request_tokens, response_tokens, total_tokens, status, status_code, error_reason, latency_ms, is_streaming, target_provider
 		FROM request_stats
 		WHERE 1=1`
 	args := []any{}
@@ -332,6 +334,8 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 			&r.ResponseTokens,
 			&r.TotalTokens,
 			&r.Status,
+			&r.StatusCode,
+			&r.ErrorReason,
 			&r.LatencyMs,
 			&streaming,
 			&r.TargetProvider,
@@ -551,6 +555,61 @@ func (d *DB) GetWeeklyUsage(keyMask string) (*WeeklyUsage, error) {
 // GetWeeklyUsageForPlan returns token and request counts for a provider/key_mask within a specific plan over the last 7 days.
 func (d *DB) GetWeeklyUsageForPlan(plan, keyMask string) (*WeeklyUsage, error) {
 	return d.GetUsageSinceForPlan(plan, keyMask, time.Now().Add(-7*24*time.Hour))
+}
+
+type LatencyStats struct {
+	Count int
+	P50   int
+	P95   int
+	Mean  int
+	Max   int
+}
+
+// GetProviderLatencyStats returns p50/p95 latency percentiles for a provider
+// from successful requests in the given time window.
+func (d *DB) GetProviderLatencyStats(provider string, since time.Time) (*LatencyStats, error) {
+	rows, err := d.conn.Query(`
+		SELECT latency_ms FROM request_stats
+		WHERE provider = ? AND status = 'success' AND created_at > ?
+		ORDER BY latency_ms
+	`, provider, since.UnixMilli())
+	if err != nil {
+		return nil, fmt.Errorf("query latency: %w", err)
+	}
+	defer rows.Close()
+
+	var vals []int
+	var sum int64
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("scan latency: %w", err)
+		}
+		vals = append(vals, v)
+		sum += int64(v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+	if len(vals) == 0 {
+		return &LatencyStats{}, nil
+	}
+
+	n := len(vals)
+	p50 := vals[n/2]
+	p95Idx := n * 95 / 100
+	if p95Idx >= n {
+		p95Idx = n - 1
+	}
+	p95 := vals[p95Idx]
+
+	return &LatencyStats{
+		Count: n,
+		P50:   p50,
+		P95:   p95,
+		Mean:  int(sum / int64(n)),
+		Max:   vals[n-1],
+	}, nil
 }
 
 type MonthlyUsage struct {

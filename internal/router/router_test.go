@@ -1567,3 +1567,64 @@ func TestRouteSelectsMatchingModelProvider(t *testing.T) {
 
 	// Success stats are recorded by the HTTP handler, not the router.
 }
+
+func TestRouteTokenLimit(t *testing.T) {
+	// Provider with a tiny context limit.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"ok"}`))
+	}))
+	defer server.Close()
+
+	sqlitePath := "/tmp/test_router_token.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-token-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health tracker: %v", err)
+	}
+	defer ht.Close()
+
+	limit := 100
+	plan := types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{
+				Name:          "tiny",
+				BaseURL:       server.URL,
+				Model:         "tiny-model",
+				Format:        "openai",
+				Timeout:       5,
+				APIKey:        "sk-tiny",
+				ContextLength: &limit,
+			},
+		},
+	}
+	if err := database.SavePlan("tiny-plan", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+
+	// Large message that exceeds the 100-token limit.
+	body := map[string]interface{}{
+		"model":    "tiny-model",
+		"messages": []map[string]string{{"role": "user", "content": strings.Repeat("hello ", 1000)}},
+	}
+
+	_, _, err = router.Route(context.Background(), "tiny-plan", body, false, "openai", nil, "")
+	if err == nil {
+		t.Fatal("expected error for oversized request, got nil")
+	}
+	if !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("expected 'too large' error, got: %v", err)
+	}
+}

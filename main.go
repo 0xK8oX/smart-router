@@ -143,7 +143,10 @@ func main() {
 		sig := <-sigCh
 		log.Printf("Received %s, shutting down gracefully...", sig)
 
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// Must stay under ecosystem.config.js kill_timeout (135s).
+		// Streaming requests can exceed 60s; 120s gives room for
+		// all in-flight requests to drain without PM2 SIGKILL.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
 		if err := srv.Shutdown(shutdownCtx); err != nil {

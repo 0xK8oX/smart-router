@@ -161,7 +161,7 @@ func TestRecordSuccessStat(t *testing.T) {
 		Model:  "gpt-4",
 		APIKey: "sk-test-key",
 	}
-	recordSuccessStat(database, "pro", provider, 100, false, data, "openai", "sr-testkey", nil)
+	recordSuccessStat(database, "pro", provider, 100, false, data, "openai", "sr-testkey", nil, 200)
 
 	database.FlushStats()
 
@@ -213,7 +213,7 @@ func TestRecordSuccessStat_NoData(t *testing.T) {
 	database := setupTestDB(t)
 
 	provider := types.ProviderConfig{Name: "test", Model: "gpt-4"}
-	recordSuccessStat(database, "pro", provider, 50, true, nil, "openai", "", nil)
+	recordSuccessStat(database, "pro", provider, 50, true, nil, "openai", "", nil, 200)
 
 	database.FlushStats()
 
@@ -320,11 +320,15 @@ func TestHandleGetModel_NotFound(t *testing.T) {
 		t.Fatalf("expected 404, got %d", rr.Code)
 	}
 
-	var resp map[string]string
+	var resp map[string]interface{}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
-	if !strings.Contains(resp["error"], "model not found") {
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected Anthropic error shape, got %v", resp)
+	}
+	if !strings.Contains(errObj["message"].(string), "model not found") {
 		t.Errorf("expected 'model not found' error, got %q", resp["error"])
 	}
 }
@@ -2160,9 +2164,13 @@ func TestHandleMessages_ModelRestriction(t *testing.T) {
 		t.Fatalf("expected 403, got %d: %s", rr.Code, rr.Body.String())
 	}
 
-	var resp map[string]string
+	var resp map[string]interface{}
 	json.Unmarshal(rr.Body.Bytes(), &resp)
-	if !strings.Contains(resp["error"], "model not allowed") {
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected Anthropic error shape, got %v", resp)
+	}
+	if !strings.Contains(errObj["message"].(string), "model not allowed") {
 		t.Errorf("expected model restriction error, got %q", resp["error"])
 	}
 }
@@ -2761,6 +2769,82 @@ func TestWriteJSON_Success(t *testing.T) {
 	writeJSON(rr, http.StatusOK, map[string]string{"status": "ok"})
 	if rr.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", rr.Code)
+	}
+}
+
+func TestHandleCountTokens(t *testing.T) {
+	_, router := setupTestServer(t, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(
+		`{"model":"k2p6","messages":[{"role":"user","content":"Hello, how are you?"}]}`,
+	))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := resp["input_tokens"]; !ok {
+		t.Errorf("expected input_tokens in response, got %v", resp)
+	}
+}
+
+func TestHandleCountTokens_WithSystemAndTools(t *testing.T) {
+	_, router := setupTestServer(t, nil)
+
+	body := `{"model":"k2p6","system":"Be helpful","messages":[{"role":"user","content":"Hello"}],"tools":[{"name":"calc","description":"A calculator","input_schema":{"type":"object","properties":{"x":{"type":"number"}}}}],"max_tokens":1000}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	tokens, ok := resp["input_tokens"].(float64)
+	if !ok {
+		t.Fatalf("expected input_tokens as number, got %v", resp["input_tokens"])
+	}
+	// ~6 (system) + ~6 (message) + ~4 (overhead) + ~30 (tools) + 1000 (max_tokens) ≈ 1046
+	if tokens < 1000 {
+		t.Errorf("expected tokens > 1000 (max_tokens included), got %v", tokens)
+	}
+}
+
+func TestHandleCountTokens_InvalidJSON(t *testing.T) {
+	_, router := setupTestServer(t, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader("not json"))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestHandleCountTokens_OPTIONS(t *testing.T) {
+	_, router := setupTestServer(t, nil)
+
+	req := httptest.NewRequest(http.MethodOptions, "/v1/messages/count_tokens", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("expected 204, got %d", rr.Code)
 	}
 }
 

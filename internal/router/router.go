@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"smart-router/internal/db"
 	"smart-router/internal/health"
 	"smart-router/internal/providers"
+	"smart-router/internal/tokenizer"
 	"smart-router/internal/translation"
 	"smart-router/internal/types"
 )
@@ -106,6 +108,147 @@ func (r *Router) InvalidateAllPlanCache() {
 const maxVirtualDepth = 3
 const smartPrefix = "smart://"
 const maxPlanCacheSize = 1000
+
+// defaultContextLength is used when a provider does not specify one.
+const defaultContextLength = 128000
+
+// countBlockTokens counts tokens in a single content block.
+// Handles Anthropic text/thinking/tool_use/tool_result and OpenAI image_url types.
+func countBlockTokens(block map[string]interface{}) int {
+	total := 0
+	t := ""
+	if typ, ok := block["type"].(string); ok {
+		t = typ
+	}
+	switch t {
+	case "text", "thinking":
+		if text, ok := block[t].(string); ok {
+			total += tokenizer.CountString(text)
+		}
+	case "tool_use":
+		// Tool name + input parameters
+		if name, ok := block["name"].(string); ok {
+			total += tokenizer.CountString(name)
+		}
+		if input, ok := block["input"]; ok {
+			total += tokenizer.CountString(fmt.Sprintf("%v", input))
+		}
+	case "tool_result":
+		if content, ok := block["content"].(string); ok {
+			total += tokenizer.CountString(content)
+		} else if contentArr, ok := block["content"].([]interface{}); ok {
+			for _, c := range contentArr {
+				if cm, ok := c.(map[string]interface{}); ok {
+					total += countBlockTokens(cm)
+				}
+			}
+		}
+	case "image_url":
+		if url, ok := block["image_url"].(map[string]interface{}); ok {
+			if s, ok := url["url"].(string); ok {
+				total += tokenizer.CountString(s) / 4
+			}
+		}
+	case "image":
+		if src, ok := block["source"].(map[string]interface{}); ok {
+			if s, ok := src["data"].(string); ok {
+				total += len(s) / 4
+			}
+		}
+	default:
+		// Fallback: stringify the entire block
+		total += tokenizer.CountString(fmt.Sprintf("%v", block))
+	}
+	return total
+}
+
+// CountRequestTokens estimates tokens in the request body.
+// It counts messages content, system prompts, tools definitions, and adds
+// a small per-message overhead. Exported for the count_tokens endpoint.
+func CountRequestTokens(body map[string]interface{}) int {
+	// Normalize types by round-tripping through JSON so that typed slices
+	// (e.g. []map[string]string) become []interface{} for uniform handling.
+	var normalized map[string]interface{}
+	if b, err := json.Marshal(body); err == nil {
+		_ = json.Unmarshal(b, &normalized)
+	}
+	if normalized == nil {
+		normalized = body
+	}
+
+	total := 0
+
+	// System messages (Anthropic format: array of blocks or single string)
+	if sys, ok := normalized["system"].([]interface{}); ok {
+		for _, s := range sys {
+			if sm, ok := s.(map[string]interface{}); ok {
+				if text, ok := sm["text"].(string); ok {
+					total += tokenizer.CountString(text)
+				}
+			} else if text, ok := s.(string); ok {
+				total += tokenizer.CountString(text)
+			}
+		}
+	} else if text, ok := normalized["system"].(string); ok {
+		total += tokenizer.CountString(text)
+	}
+
+	// Messages array
+	if msgs, ok := normalized["messages"].([]interface{}); ok {
+		for _, m := range msgs {
+			msg, ok := m.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			// Content can be string (OpenAI) or []blocks (Anthropic)
+			switch c := msg["content"].(type) {
+			case string:
+				total += tokenizer.CountString(c)
+			case []interface{}:
+				for _, block := range c {
+					if bm, ok := block.(map[string]interface{}); ok {
+						total += countBlockTokens(bm)
+					}
+				}
+			}
+			// Role + formatting overhead per message
+			total += 4
+		}
+	}
+
+	// Tools definitions
+	if tools, ok := normalized["tools"].([]interface{}); ok {
+		for _, t := range tools {
+			total += tokenizer.CountString(fmt.Sprintf("%v", t))
+		}
+	}
+
+	// Max tokens reservation (what the client expects to receive back)
+	if maxTok, ok := normalized["max_tokens"].(float64); ok {
+		total += int(maxTok)
+	} else if maxTok, ok := normalized["max_tokens"].(int); ok {
+		total += maxTok
+	}
+
+	return total
+}
+
+// tokenLimitMargin is the safety margin applied to provider context limits.
+// A 15% buffer accounts for tokenizer/counting differences between the router
+// and upstream providers (especially tool_use/tool_result blocks).
+const tokenLimitMargin = 0.85
+
+// providerLimit returns the effective context length limit for a provider,
+// with a safety margin applied.
+func providerLimit(p types.ProviderConfig) int {
+	var limit int
+	if p.ContextLength != nil && *p.ContextLength > 0 {
+		limit = *p.ContextLength
+	} else {
+		limit = defaultContextLength
+	}
+	return int(float64(limit) * tokenLimitMargin)
+}
 
 func isVirtualProvider(baseURL string) bool {
 	return strings.HasPrefix(baseURL, smartPrefix)
@@ -211,6 +354,9 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 	var providerErrors []string
 	now := time.Now().Unix()
 
+	// Pre-flight token count — computed once, checked against each provider's limit.
+	tokCount := CountRequestTokens(body)
+
 	for _, provider := range orderedProviders {
 		// Virtual provider: route internally to another plan instead of making an HTTP call.
 		if isVirtualProvider(provider.BaseURL) {
@@ -251,6 +397,12 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			continue
 		}
 
+		// Pre-flight token check: skip provider if request exceeds its context limit.
+		if limit := providerLimit(provider); tokCount > limit {
+			providerErrors = append(providerErrors, fmt.Sprintf("%s: request too large (%d tokens > %d limit)", provider.Name, tokCount, limit))
+			continue
+		}
+
 		// Override model with provider's configured model
 		translatedBody := make(map[string]interface{}, len(body))
 		for k, v := range body {
@@ -264,12 +416,14 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			// Translation error is fatal for this provider, try next
 			_ = r.healthTracker.RecordFailure(provider.Name, 0, err.Error())
 			r.db.RecordStatAsync(types.StatRecord{
-				Plan:      planSlug,
-				Provider:  provider.Name,
-				Model:     provider.Model,
-				KeyMask:   types.MaskAPIKey(provider.APIKey),
-				ClientKey: clientKey,
-				Status:    "failure",
+				Plan:        planSlug,
+				Provider:    provider.Name,
+				Model:       provider.Model,
+				KeyMask:     types.MaskAPIKey(provider.APIKey),
+				ClientKey:   clientKey,
+				Status:      "failure",
+				StatusCode:  0,
+				ErrorReason: health.ClassifyFailure(0, err.Error()),
 			})
 			providerErrors = append(providerErrors, fmt.Sprintf("%s: translate error", provider.Name))
 			continue
@@ -311,6 +465,8 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 				KeyMask:     types.MaskAPIKey(provider.APIKey),
 				ClientKey:   clientKey,
 				Status:      "failure",
+				StatusCode:  0,
+				ErrorReason: health.ClassifyFailure(0, err.Error()),
 				LatencyMs:   latencyMs,
 				IsStreaming: isStreaming,
 			})
@@ -336,7 +492,7 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 		}
 
 		latencyMs := time.Since(start).Milliseconds()
-		log.Printf("[ROUTER] FAILURE: plan=%s provider=%s status=%d latency=%dms", planSlug, provider.Name, resp.StatusCode, latencyMs)
+		log.Printf("[ROUTER] FAILURE: plan=%s provider=%s status=%d latency=%dms body=%s", planSlug, provider.Name, resp.StatusCode, latencyMs, errBody)
 		_ = r.healthTracker.RecordFailure(provider.Name, resp.StatusCode, errBody)
 		r.db.RecordStatAsync(types.StatRecord{
 			Plan:        planSlug,
@@ -345,6 +501,8 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			KeyMask:     types.MaskAPIKey(provider.APIKey),
 			ClientKey:   clientKey,
 			Status:      "failure",
+			StatusCode:  resp.StatusCode,
+			ErrorReason: health.ClassifyFailure(resp.StatusCode, errBody),
 			LatencyMs:   latencyMs,
 			IsStreaming: isStreaming,
 		})
