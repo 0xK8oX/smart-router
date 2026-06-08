@@ -334,8 +334,14 @@ func (r *Router) providerScore(p types.ProviderConfig, requestedModel string) fl
 	return score
 }
 
+// ExtractSource delegates to db.ExtractSource for use in stat records.
+func extractSource(headers http.Header) string {
+	return db.ExtractSource(headers.Get("User-Agent"))
+}
+
 func (r *Router) Route(ctx context.Context, planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, clientKey string) (*http.Response, types.ProviderConfig, error) {
-	return r.routeWithDepth(ctx, planSlug, body, isStreaming, clientFormat, headers, 0, clientKey, nil)
+	source := extractSource(headers)
+	return r.routeWithDepth(ctx, planSlug, body, isStreaming, clientFormat, headers, 0, clientKey, nil, source)
 }
 
 func (r *Router) applyStrategy(planSlug string, strategy string, providers []types.ProviderConfig) []types.ProviderConfig {
@@ -401,7 +407,7 @@ func (r *Router) applyStrategy(planSlug string, strategy string, providers []typ
 	}
 }
 
-func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, depth int, clientKey string, visited map[string]bool) (*http.Response, types.ProviderConfig, error) {
+func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, depth int, clientKey string, visited map[string]bool, source string) (*http.Response, types.ProviderConfig, error) {
 	plan, err := r.getPlanCached(planSlug)
 	if err != nil {
 		return nil, types.ProviderConfig{}, fmt.Errorf("load plan: %w", err)
@@ -460,7 +466,7 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 				visitedCopy[k] = v
 			}
 			visitedCopy[targetPlan] = true
-			resp, actualProvider, err := r.routeWithDepth(ctx, targetPlan, body, isStreaming, clientFormat, headers, depth+1, clientKey, visitedCopy)
+			resp, actualProvider, err := r.routeWithDepth(ctx, targetPlan, body, isStreaming, clientFormat, headers, depth+1, clientKey, visitedCopy, source)
 			if err != nil {
 				providerErrors = append(providerErrors, fmt.Sprintf("%s: virtual redirect to %s failed: %v", provider.Name, targetPlan, err))
 				continue
@@ -504,6 +510,7 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 				Model:       provider.Model,
 				KeyMask:     types.MaskAPIKey(provider.APIKey),
 				ClientKey:   clientKey,
+				Source:      source,
 				Status:      "failure",
 				StatusCode:  0,
 				ErrorReason: health.ClassifyFailure(0, err.Error()),
@@ -551,6 +558,7 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 				Model:       provider.Model,
 				KeyMask:     types.MaskAPIKey(provider.APIKey),
 				ClientKey:   clientKey,
+				Source:      source,
 				Status:      "failure",
 				StatusCode:  0,
 				ErrorReason: health.ClassifyFailure(0, err.Error()),
@@ -587,6 +595,7 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			Model:       provider.Model,
 			KeyMask:     types.MaskAPIKey(provider.APIKey),
 			ClientKey:   clientKey,
+			Source:      source,
 			Status:      "failure",
 			StatusCode:  resp.StatusCode,
 			ErrorReason: health.ClassifyFailure(resp.StatusCode, errBody),

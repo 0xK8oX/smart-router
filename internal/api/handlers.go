@@ -19,6 +19,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"gopkg.in/yaml.v3"
+	dbpkg "smart-router/internal/db"
 	"smart-router/internal/auth"
 	"smart-router/internal/db"
 	"smart-router/internal/health"
@@ -293,7 +294,7 @@ func fallbackCount(reqBody map[string]interface{}, respData []byte, format strin
 	return
 }
 
-func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig, latencyMs int64, isStreaming bool, data []byte, clientFormat string, clientKey string, reqBody map[string]interface{}, statusCode int) {
+func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig, latencyMs int64, isStreaming bool, data []byte, clientFormat string, clientKey string, reqBody map[string]interface{}, statusCode int, userAgent string) {
 	reqTokens, respTokens := 0, 0
 	if len(data) > 0 {
 		reqTokens, respTokens = extractUsage(data, clientFormat)
@@ -307,6 +308,7 @@ func recordSuccessStat(db *db.DB, planSlug string, provider types.ProviderConfig
 		Model:          provider.Model,
 		KeyMask:        types.MaskAPIKey(provider.APIKey),
 		ClientKey:      clientKey,
+		Source:         dbpkg.ExtractSource(userAgent),
 		RequestTokens:  reqTokens,
 		ResponseTokens: respTokens,
 		TotalTokens:    reqTokens + respTokens,
@@ -392,7 +394,7 @@ var streamBufPool = sync.Pool{
 	},
 }
 
-func (s *Server) proxyStream(ctx context.Context, w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string, clientKey string, reqBody map[string]interface{}, statusCode int) {
+func (s *Server) proxyStream(ctx context.Context, w http.ResponseWriter, bodyReader io.Reader, planSlug string, provider types.ProviderConfig, start time.Time, clientFormat string, clientKey string, reqBody map[string]interface{}, statusCode int, userAgent string) {
 	if closer, ok := bodyReader.(io.Closer); ok {
 		defer closer.Close()
 	}
@@ -417,6 +419,7 @@ func (s *Server) proxyStream(ctx context.Context, w http.ResponseWriter, bodyRea
 			Model:          provider.Model,
 			KeyMask:        types.MaskAPIKey(provider.APIKey),
 			ClientKey:      clientKey,
+			Source:         dbpkg.ExtractSource(userAgent),
 			RequestTokens:  reqTokens,
 			ResponseTokens: respTokens,
 			TotalTokens:    reqTokens + respTokens,
@@ -580,7 +583,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 		if provider.Format != clientFormat {
 			bodyReader = translation.SSETranslator(resp.Body, provider.Format, clientFormat)
 		}
-		s.proxyStream(r.Context(), w, bodyReader, planSlug, provider, start, clientFormat, clientKey, body, resp.StatusCode)
+		s.proxyStream(r.Context(), w, bodyReader, planSlug, provider, start, clientFormat, clientKey, body, resp.StatusCode, r.Header.Get("User-Agent"))
 		return
 	}
 
@@ -608,7 +611,7 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 	w.Header().Del("Content-Length")
 
 	latencyMs := time.Since(start).Milliseconds()
-	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat, clientKey, body, resp.StatusCode)
+	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, clientFormat, clientKey, body, resp.StatusCode, r.Header.Get("User-Agent"))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
@@ -1004,15 +1007,24 @@ func (s *Server) handleStatsAggregated(w http.ResponseWriter, r *http.Request) {
 			key = s.Plan
 		case "model":
 			key = s.Model
+		case "source":
+			key = s.Source
+			if key == "" {
+				key = "unknown"
+			}
+		case "client_key":
+			key = s.ClientKey
 		default:
 			key = s.Provider
 		}
 
 		if _, ok := aggregated[key]; !ok {
 			aggregated[key] = map[string]int64{
-				"total":   0,
-				"success": 0,
-				"failure": 0,
+				"total":          0,
+				"success":        0,
+				"failure":        0,
+				"request_tokens": 0,
+				"response_tokens": 0,
 			}
 		}
 		aggregated[key]["total"]++
@@ -1021,6 +1033,8 @@ func (s *Server) handleStatsAggregated(w http.ResponseWriter, r *http.Request) {
 		} else {
 			aggregated[key]["failure"]++
 		}
+		aggregated[key]["request_tokens"] += int64(s.RequestTokens)
+		aggregated[key]["response_tokens"] += int64(s.ResponseTokens)
 	}
 
 	writeJSON(w, http.StatusOK, aggregated)

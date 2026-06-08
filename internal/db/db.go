@@ -38,8 +38,10 @@ var migrations = []string{
 	`ALTER TABLE request_stats ADD COLUMN target_provider TEXT;`,
 	`ALTER TABLE request_stats ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0;`,
 	`ALTER TABLE request_stats ADD COLUMN error_reason TEXT;`,
+	`ALTER TABLE request_stats ADD COLUMN source TEXT;`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_client_key ON request_stats(client_key);`,
 	`CREATE INDEX IF NOT EXISTS idx_stats_client_created ON request_stats(client_key, created_at);`,
+	`CREATE INDEX IF NOT EXISTS idx_stats_source ON request_stats(source);`,
 	`CREATE TABLE IF NOT EXISTS plans (
 		slug TEXT PRIMARY KEY,
 		config TEXT NOT NULL
@@ -95,6 +97,32 @@ type DB struct {
 	pricingCache      map[string][2]float64
 	pricingCacheMu    sync.RWMutex
 	pricingCacheUntil time.Time
+}
+
+// ExtractSource classifies the request source from the User-Agent header.
+// Returns a short, human-readable label like "claude-code", "hermes", "openai", etc.
+func ExtractSource(userAgent string) string {
+	ua := strings.ToLower(userAgent)
+	switch {
+	case strings.Contains(ua, "claude-cli"), strings.Contains(ua, "claude-code"):
+		return "claude-code"
+	case strings.Contains(ua, "hermes"):
+		return "hermes"
+	case strings.Contains(ua, "openai"):
+		return "openai"
+	case strings.Contains(ua, "anthropic"):
+		return "anthropic"
+	case strings.Contains(ua, "curl"):
+		return "curl"
+	case strings.Contains(ua, "python-httpx"), strings.Contains(ua, "python-requests"), strings.Contains(ua, "aiohttp"):
+		return "python"
+	case strings.Contains(ua, "node"), strings.Contains(ua, "axios"):
+		return "node"
+	case ua == "":
+		return "unknown"
+	default:
+		return "other"
+	}
 }
 
 func (d *DB) WithEncryptionKey(key []byte) *DB {
@@ -173,9 +201,9 @@ func (d *DB) RecordStatBatch(records []types.StatRecord) error {
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO request_stats
-			(plan, provider, model, key_mask, client_key, request_tokens, response_tokens, total_tokens, status, status_code, error_reason, latency_ms, is_streaming, target_provider)
+			(plan, provider, model, key_mask, client_key, source, request_tokens, response_tokens, total_tokens, status, status_code, error_reason, latency_ms, is_streaming, target_provider)
 		VALUES
-			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare batch stmt: %w", err)
@@ -188,7 +216,7 @@ func (d *DB) RecordStatBatch(records []types.StatRecord) error {
 			streaming = 1
 		}
 		if _, err := stmt.Exec(
-			r.Plan, r.Provider, r.Model, r.KeyMask, r.ClientKey,
+			r.Plan, r.Provider, r.Model, r.KeyMask, r.ClientKey, r.Source,
 			r.RequestTokens, r.ResponseTokens, r.TotalTokens,
 			r.Status, r.StatusCode, r.ErrorReason, r.LatencyMs, streaming, r.TargetProvider,
 		); err != nil {
@@ -297,7 +325,7 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 		limit = maxLimit
 	}
 	query := `
-		SELECT plan, provider, model, key_mask, client_key, request_tokens, response_tokens, total_tokens, status, status_code, error_reason, latency_ms, is_streaming, target_provider
+		SELECT plan, provider, model, key_mask, client_key, source, request_tokens, response_tokens, total_tokens, status, status_code, error_reason, latency_ms, is_streaming, target_provider
 		FROM request_stats
 		WHERE 1=1`
 	args := []any{}
@@ -324,12 +352,14 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 	for rows.Next() {
 		var r types.StatRecord
 		var streaming int
+		var source sql.NullString
 		err := rows.Scan(
 			&r.Plan,
 			&r.Provider,
 			&r.Model,
 			&r.KeyMask,
 			&r.ClientKey,
+			&source,
 			&r.RequestTokens,
 			&r.ResponseTokens,
 			&r.TotalTokens,
@@ -342,6 +372,9 @@ func (d *DB) GetStats(plan, provider string, limit int) ([]types.StatRecord, err
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scan stat: %w", err)
+		}
+		if source.Valid {
+			r.Source = source.String
 		}
 		r.IsStreaming = streaming != 0
 		results = append(results, r)

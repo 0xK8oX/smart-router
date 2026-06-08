@@ -1241,3 +1241,25 @@ func TestGetWeeklyUsageForPlan(t *testing.T) {
 		t.Errorf("expected response_tokens=80, got %d", usage.ResponseTokens)
 	}
 }
+
+func TestExtractSource(t *testing.T) {
+	tests := []struct {
+		ua   string
+		want string
+	}{
+		{"claude-cli/2.1.143 (external, cli)", "claude-code"},
+		{"Claude-Code/1.0.0", "claude-code"},
+		{"hermes-agent/1.0.0", "hermes"},
+		{"OpenAI/Python 2.32.0", "openai"},
+		{"python-httpx/0.28.1", "python"},
+		{"curl/8.4.0", "curl"},
+		{"Mozilla/5.0", "other"},
+		{"", "unknown"},
+	}
+	for _, tt := range tests {
+		got := ExtractSource(tt.ua)
+		if got != tt.want {
+			t.Errorf("ExtractSource(%q) = %q, want %q", tt.ua, got, tt.want)
+		}
+	}
+}

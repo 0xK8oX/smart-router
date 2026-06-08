@@ -161,7 +161,7 @@ func TestRecordSuccessStat(t *testing.T) {
 		Model:  "gpt-4",
 		APIKey: "sk-test-key",
 	}
-	recordSuccessStat(database, "pro", provider, 100, false, data, "openai", "sr-testkey", nil, 200)
+	recordSuccessStat(database, "pro", provider, 100, false, data, "openai", "sr-testkey", nil, 200, "claude-cli/2.1.143")
 
 	database.FlushStats()
 
@@ -213,7 +213,7 @@ func TestRecordSuccessStat_NoData(t *testing.T) {
 	database := setupTestDB(t)
 
 	provider := types.ProviderConfig{Name: "test", Model: "gpt-4"}
-	recordSuccessStat(database, "pro", provider, 50, true, nil, "openai", "", nil, 200)
+	recordSuccessStat(database, "pro", provider, 50, true, nil, "openai", "", nil, 200, "hermes-agent/1.0")
 
 	database.FlushStats()
 
