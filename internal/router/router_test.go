@@ -1705,3 +1705,61 @@ func TestRouteAdaptiveStrategy(t *testing.T) {
 		t.Errorf("expected fast provider to dominate, but got %d/20", fastCount)
 	}
 }
+
+
+func TestRouteTokenLimitFallback(t *testing.T) {
+	// Two providers: small (returns 400 token limit) and large (succeeds).
+	smallServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"Invalid request: Your request exceeded model token limit: 262144 (requested: 477883)"}}`))
+	}))
+	defer smallServer.Close()
+
+	largeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"large","object":"chat.completion","choices":[]}`))
+	}))
+	defer largeServer.Close()
+
+	sqlitePath := "/tmp/test_router_token_fallback.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-token-fallback-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, _ := db.Open(sqlitePath)
+	defer database.Close()
+	ht, _ := health.New(badgerDir)
+	defer ht.Close()
+
+	plan := types.PlanConfig{
+		Strategy: "round_robin",
+		Providers: []types.ProviderConfig{
+			{Name: "small", Model: "k2p6", BaseURL: smallServer.URL, Format: "openai", APIKey: "sk-small", Timeout: 30},
+			{Name: "large", Model: "k2p6", BaseURL: largeServer.URL, Format: "openai", APIKey: "sk-large", Timeout: 30},
+		},
+	}
+	if err := database.SavePlan("fallback-plan", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+	body := map[string]interface{}{
+		"model":    "k2p6",
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	}
+
+	resp, provider, err := router.Route(context.Background(), "fallback-plan", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("expected fallback to succeed, got error: %v", err)
+	}
+	if provider.Name != "large" {
+		t.Errorf("expected fallback to large provider, got %s", provider.Name)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 from large, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}

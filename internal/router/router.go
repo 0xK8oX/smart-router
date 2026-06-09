@@ -594,6 +594,17 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			resp.Body.Close()
 		}
 
+		// Special case: token-limit 400 — the request is too big for THIS
+		// provider but might fit in providers with higher context. Skip
+		// the failure stat and try the next provider instead of counting
+		// this as a generic failure.
+		if resp.StatusCode == 400 && strings.Contains(errBody, "token limit") {
+			providerErrors = append(providerErrors, fmt.Sprintf("%s: request too large for provider (token limit)", provider.Name))
+			// Don't record this as a provider failure — the provider is fine,
+			// the request is just too big for it. Move on.
+			continue
+		}
+
 		latencyMs = time.Since(start).Milliseconds()
 		log.Printf("[ROUTER] FAILURE: plan=%s provider=%s status=%d latency=%dms body=%s", planSlug, provider.Name, resp.StatusCode, latencyMs, errBody)
 		_ = r.healthTracker.RecordFailure(provider.Name, resp.StatusCode, errBody)
