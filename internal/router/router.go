@@ -218,8 +218,9 @@ func CountRequestTokens(body map[string]interface{}) int {
 					}
 				}
 			}
-			// Role + formatting overhead per message
-			total += 4
+			// Per-message overhead: real Anthropic API adds ~6-8 tokens
+			// per message for role/metadata/formatting. Use 8 to be safe.
+			total += 8
 		}
 	}
 
@@ -227,7 +228,14 @@ func CountRequestTokens(body map[string]interface{}) int {
 	if tools, ok := normalized["tools"].([]interface{}); ok {
 		for _, t := range tools {
 			total += tokenizer.CountString(fmt.Sprintf("%v", t))
+			// Per-tool overhead: tool definition metadata
+			total += 50
 		}
+	}
+
+	// System message overhead (system prompt framing)
+	if _, hasSystem := normalized["system"]; hasSystem {
+		total += 20
 	}
 
 	// Max tokens reservation (what the client expects to receive back)
@@ -241,9 +249,12 @@ func CountRequestTokens(body map[string]interface{}) int {
 }
 
 // tokenLimitMargin is the safety margin applied to provider context limits.
-// A 15% buffer accounts for tokenizer/counting differences between the router
-// and upstream providers (especially tool_use/tool_result blocks).
-const tokenLimitMargin = 0.85
+// A 30% buffer accounts for tokenizer/counting differences between the router
+// and upstream providers (especially tool_use/tool_result blocks with
+// base64 content and nested structures that are hard to count exactly).
+// The router uses tiktoken cl100k_base but providers may have their own
+// tokenizers (Kimi, MiniMax) with different overheads.
+const tokenLimitMargin = 0.70
 
 // providerLimit returns the effective context length limit for a provider,
 // with a safety margin applied.
