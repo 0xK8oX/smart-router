@@ -443,6 +443,13 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 	var providerErrors []string
 	now := time.Now().Unix()
 
+	// Track providers that were eligible to handle the request (not skipped for
+	// health/cooldown/virtual-depth) and whether they all failed because the
+	// request is too large. This lets us return 413 even when some providers
+	// happen to be on cooldown.
+	eligibleCount := 0
+	tooLargeCount := 0
+
 	// Pre-flight token count — computed once, checked against each provider's limit.
 	tokCount := CountRequestTokens(body)
 
@@ -483,6 +490,8 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 				providerErrors = append(providerErrors, fmt.Sprintf("%s: virtual provider cycle detected at %s", provider.Name, targetPlan))
 				continue
 			}
+			// Virtual providers are not eligible for the too-large check because
+			// they delegate to a different plan with its own limits.
 			visitedCopy := make(map[string]bool, len(visited)+1)
 			for k, v := range visited {
 				visitedCopy[k] = v
@@ -508,9 +517,14 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			continue
 		}
 
+		// Provider is eligible: it passed health/virtual checks. From here on,
+		// any failure is either "too large" or a real attempt failure.
+		eligibleCount++
+
 		// Pre-flight token check: skip provider if request exceeds its context limit.
 		if limit := providerLimit(provider); tokCount > limit {
 			providerErrors = append(providerErrors, fmt.Sprintf("%s: request too large (%d tokens > %d limit)", provider.Name, tokCount, limit))
+			tooLargeCount++
 			continue
 		}
 
@@ -616,6 +630,7 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 		// this as a generic failure.
 		if resp.StatusCode == 400 && strings.Contains(errBody, "token limit") {
 			providerErrors = append(providerErrors, fmt.Sprintf("%s: request too large for provider (token limit)", provider.Name))
+			tooLargeCount++
 			// Don't record this as a provider failure — the provider is fine,
 			// the request is just too big for it. Move on.
 			continue
@@ -641,18 +656,10 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 		providerErrors = append(providerErrors, fmt.Sprintf("%s: HTTP %d %s", provider.Name, resp.StatusCode, errBody))
 	}
 
-	// Check if ALL failures are "request too large" pre-flight rejections —
-	// in that case the request genuinely doesn't fit any provider, so
-	// signal ErrRequestTooLarge so the handler can return 413 with a
-	// clear "please run /compact" message.
-	allTooLarge := len(providerErrors) > 0
-	for _, e := range providerErrors {
-		if !strings.Contains(e, "request too large") {
-			allTooLarge = false
-			break
-		}
-	}
-	if allTooLarge {
+	// Check if every eligible provider failed because the request was too large.
+	// Providers skipped for health/cooldown/virtual-depth don't count against this,
+	// so a temporarily unhealthy provider doesn't mask a genuine oversized request.
+	if eligibleCount > 0 && tooLargeCount == eligibleCount {
 		return nil, types.ProviderConfig{}, fmt.Errorf("%w: %s", ErrRequestTooLarge, strings.Join(providerErrors, "; "))
 	}
 

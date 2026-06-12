@@ -20,12 +20,12 @@ import (
 
 	"github.com/gorilla/mux"
 	"gopkg.in/yaml.v3"
-	dbpkg "smart-router/internal/db"
 	"smart-router/internal/auth"
 	"smart-router/internal/db"
+	dbpkg "smart-router/internal/db"
 	"smart-router/internal/health"
-	"smart-router/internal/tokenizer"
 	"smart-router/internal/router"
+	"smart-router/internal/tokenizer"
 	"smart-router/internal/translation"
 	"smart-router/internal/types"
 )
@@ -422,7 +422,7 @@ func (s *Server) proxyStream(ctx context.Context, w http.ResponseWriter, bodyRea
 			KeyMask:        types.MaskAPIKey(provider.APIKey),
 			ClientKey:      clientKey,
 			Source:         dbpkg.ExtractSource(userAgent),
-		UserAgent:      userAgent,
+			UserAgent:      userAgent,
 			RequestTokens:  reqTokens,
 			ResponseTokens: respTokens,
 			TotalTokens:    reqTokens + respTokens,
@@ -491,8 +491,8 @@ func (s *Server) proxyStream(ctx context.Context, w http.ResponseWriter, bodyRea
 }
 
 const (
-	maxRequestBodySize  = 10 * 1024 * 1024  // 10MB
-	maxResponseBodySize = 50 * 1024 * 1024  // 50MB
+	maxRequestBodySize  = 10 * 1024 * 1024 // 10MB
+	maxResponseBodySize = 50 * 1024 * 1024 // 50MB
 )
 
 func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, clientFormat string) {
@@ -775,6 +775,9 @@ func (s *Server) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if err := s.db.RecordAudit("plan_updated", slug, types.MaskAPIKey(r.Header.Get("X-Admin-Key")), fmt.Sprintf("providers: %d -> %d", len(existing.Providers), len(plan.Providers))); err != nil {
+		log.Printf("audit log failed for plan_updated %s: %v", slug, err)
+	}
 	s.router.InvalidatePlanCache(slug)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -791,9 +794,17 @@ func (s *Server) handleDeletePlan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slug := mux.Vars(r)["slug"]
+	existing, err := s.db.GetPlan(slug)
+	if err != nil {
+		writeError(w, r, http.StatusNotFound, "plan not found")
+		return
+	}
 	if err := s.db.DeletePlan(slug); err != nil {
 		writeError(w, r, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if err := s.db.RecordAudit("plan_deleted", slug, types.MaskAPIKey(r.Header.Get("X-Admin-Key")), fmt.Sprintf("providers: %d", len(existing.Providers))); err != nil {
+		log.Printf("audit log failed for plan_deleted %s: %v", slug, err)
 	}
 	s.router.InvalidatePlanCache(slug)
 
@@ -1032,10 +1043,10 @@ func (s *Server) handleStatsAggregated(w http.ResponseWriter, r *http.Request) {
 
 		if _, ok := aggregated[key]; !ok {
 			aggregated[key] = map[string]int64{
-				"total":          0,
-				"success":        0,
-				"failure":        0,
-				"request_tokens": 0,
+				"total":           0,
+				"success":         0,
+				"failure":         0,
+				"request_tokens":  0,
 				"response_tokens": 0,
 			}
 		}

@@ -1798,7 +1798,7 @@ func TestRouteReturnsErrRequestTooLarge(t *testing.T) {
 	router := New(ht, database)
 	body := map[string]interface{}{
 		"model":    "gpt-4",
-		"messages": []map[string]string{{"role": "user", "content": strings.Repeat("x", 10000)}},  // 10K chars
+		"messages": []map[string]string{{"role": "user", "content": strings.Repeat("x", 10000)}}, // 10K chars
 	}
 
 	_, _, err := router.Route(context.Background(), "small-plan", body, false, "openai", nil, "")
@@ -1807,6 +1807,58 @@ func TestRouteReturnsErrRequestTooLarge(t *testing.T) {
 	}
 	if !errors.Is(err, ErrRequestTooLarge) {
 		t.Errorf("expected ErrRequestTooLarge, got %v", err)
+	}
+}
+
+func TestRouteRequestTooLargeDespiteCooldown(t *testing.T) {
+	// One provider is on cooldown, the others are too small. The router should
+	// still return ErrRequestTooLarge because every eligible provider rejected
+	// the request for being too large.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	sqlitePath := "/tmp/test_router_too_large_cooldown.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-too-large-cooldown-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, _ := db.Open(sqlitePath)
+	defer database.Close()
+	ht, _ := health.New(badgerDir)
+	defer ht.Close()
+
+	plan := types.PlanConfig{
+		Strategy: "round_robin",
+		Providers: []types.ProviderConfig{
+			{Name: "large-cooldown", Model: "gpt-4", BaseURL: server.URL, Format: "openai", APIKey: "sk-big", Timeout: 30, ContextLength: intPtr(1000000)},
+			{Name: "small1", Model: "gpt-4", BaseURL: server.URL, Format: "openai", APIKey: "sk-1", Timeout: 30, ContextLength: intPtr(1000)},
+			{Name: "small2", Model: "gpt-4", BaseURL: server.URL, Format: "openai", APIKey: "sk-2", Timeout: 30, ContextLength: intPtr(1000)},
+		},
+	}
+	if err := database.SavePlan("mixed-plan", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	// Put the large provider on cooldown.
+	_ = ht.RecordFailure("large-cooldown", 503, "unavailable")
+	_ = ht.RecordFailure("large-cooldown", 503, "unavailable")
+	_ = ht.RecordFailure("large-cooldown", 503, "unavailable")
+
+	router := New(ht, database)
+	body := map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": []map[string]string{{"role": "user", "content": strings.Repeat("x", 10000)}},
+	}
+
+	_, _, err := router.Route(context.Background(), "mixed-plan", body, false, "openai", nil, "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrRequestTooLarge) {
+		t.Errorf("expected ErrRequestTooLarge when all eligible providers are too small, got %v", err)
 	}
 }
 

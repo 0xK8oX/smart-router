@@ -586,6 +586,16 @@ func TestHandleUpdatePlan(t *testing.T) {
 	if len(updated.Providers) != 1 || updated.Providers[0].Name != "new" {
 		t.Fatalf("plan not updated: %+v", updated)
 	}
+	logs, err := database.ListAuditLogs(1)
+	if err != nil {
+		t.Fatalf("ListAuditLogs failed: %v", err)
+	}
+	if len(logs) != 1 || logs[0]["action"] != "plan_updated" || logs[0]["target_key"] != "pro" {
+		t.Fatalf("expected plan_updated audit log, got %+v", logs)
+	}
+	if details, ok := logs[0]["details"].(string); !ok || !strings.Contains(details, "providers: 1 -> 1") {
+		t.Fatalf("expected audit details to contain %q, got %+v", "providers: 1 -> 1", logs[0])
+	}
 
 	// Without admin key
 	req = httptest.NewRequest(http.MethodPut, "/v1/plans/pro", bytes.NewReader(body))
@@ -623,7 +633,12 @@ func TestHandleUpdatePlan_InvalidJSON(t *testing.T) {
 func TestHandleDeletePlan(t *testing.T) {
 	database := setupTestDB(t)
 
-	_ = database.SavePlan("temp", types.PlanConfig{})
+	_ = database.SavePlan("temp", types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "one"},
+			{Name: "two"},
+		},
+	})
 
 	_, router := setupTestServer(t, database)
 
@@ -640,6 +655,16 @@ func TestHandleDeletePlan(t *testing.T) {
 	_, err := database.GetPlan("temp")
 	if err == nil {
 		t.Fatal("expected plan to be deleted")
+	}
+	logs, err := database.ListAuditLogs(1)
+	if err != nil {
+		t.Fatalf("ListAuditLogs failed: %v", err)
+	}
+	if len(logs) != 1 || logs[0]["action"] != "plan_deleted" || logs[0]["target_key"] != "temp" {
+		t.Fatalf("expected plan_deleted audit log, got %+v", logs)
+	}
+	if details, ok := logs[0]["details"].(string); !ok || !strings.Contains(details, "providers: 2") {
+		t.Fatalf("expected audit details to contain %q, got %+v", "providers: 2", logs[0])
 	}
 }
 
@@ -1988,8 +2013,8 @@ func TestHandleDeletePlan_NotFound(t *testing.T) {
 	rr := httptest.NewRecorder()
 	router.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -2092,8 +2117,8 @@ func TestHandleMessages(t *testing.T) {
 	srv.router.InvalidateAllPlanCache()
 
 	reqBody := map[string]interface{}{
-		"model":    "claude-3",
-		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "Hi"}},
+		"model":      "claude-3",
+		"messages":   []interface{}{map[string]interface{}{"role": "user", "content": "Hi"}},
 		"max_tokens": 1024,
 	}
 	bodyBytes, _ := json.Marshal(reqBody)
@@ -2847,4 +2872,3 @@ func TestHandleCountTokens_OPTIONS(t *testing.T) {
 		t.Errorf("expected 204, got %d", rr.Code)
 	}
 }
-
