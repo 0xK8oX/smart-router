@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1763,3 +1764,50 @@ func TestRouteTokenLimitFallback(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+
+func TestRouteReturnsErrRequestTooLarge(t *testing.T) {
+	// All providers have small context — request will exceed all of them.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	sqlitePath := "/tmp/test_router_too_large.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-too-large-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+
+	database, _ := db.Open(sqlitePath)
+	defer database.Close()
+	ht, _ := health.New(badgerDir)
+	defer ht.Close()
+
+	plan := types.PlanConfig{
+		Strategy: "round_robin",
+		Providers: []types.ProviderConfig{
+			{Name: "small1", Model: "gpt-4", BaseURL: server.URL, Format: "openai", APIKey: "sk-1", Timeout: 30, ContextLength: intPtr(1000)},
+			{Name: "small2", Model: "gpt-4", BaseURL: server.URL, Format: "openai", APIKey: "sk-2", Timeout: 30, ContextLength: intPtr(1000)},
+		},
+	}
+	if err := database.SavePlan("small-plan", plan); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+	body := map[string]interface{}{
+		"model":    "gpt-4",
+		"messages": []map[string]string{{"role": "user", "content": strings.Repeat("x", 10000)}},  // 10K chars
+	}
+
+	_, _, err := router.Route(context.Background(), "small-plan", body, false, "openai", nil, "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrRequestTooLarge) {
+		t.Errorf("expected ErrRequestTooLarge, got %v", err)
+	}
+}
+
+func intPtr(v int) *int { return &v }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -561,6 +562,13 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 
 	resp, provider, err := s.router.Route(r.Context(), planSlug, body, isStreaming, clientFormat, r.Header, clientKey)
 	if err != nil {
+		// Request too large for all providers — return 413 with clear
+		// instruction to run /compact.
+		if errors.Is(err, router.ErrRequestTooLarge) {
+			w.Header().Set("X-Recovery", "run /compact to shrink conversation")
+			writeError(w, r, http.StatusRequestEntityTooLarge, "Request exceeds all providers' context limits. Run /compact to shrink the conversation, or start a new session.")
+			return
+		}
 		writeError(w, r, http.StatusServiceUnavailable, err.Error())
 		return
 	}

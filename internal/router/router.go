@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -115,6 +116,10 @@ func (r *Router) InvalidateAllPlanCache() {
 const maxVirtualDepth = 3
 const smartPrefix = "smart://"
 const maxPlanCacheSize = 1000
+
+// ErrRequestTooLarge is returned when a request exceeds all providers' context
+// limits. The handler maps this to HTTP 413.
+var ErrRequestTooLarge = errors.New("request exceeds all providers' context limits")
 
 // defaultContextLength is used when a provider does not specify one.
 const defaultContextLength = 128000
@@ -634,6 +639,21 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			IsStreaming: isStreaming,
 		})
 		providerErrors = append(providerErrors, fmt.Sprintf("%s: HTTP %d %s", provider.Name, resp.StatusCode, errBody))
+	}
+
+	// Check if ALL failures are "request too large" pre-flight rejections —
+	// in that case the request genuinely doesn't fit any provider, so
+	// signal ErrRequestTooLarge so the handler can return 413 with a
+	// clear "please run /compact" message.
+	allTooLarge := len(providerErrors) > 0
+	for _, e := range providerErrors {
+		if !strings.Contains(e, "request too large") {
+			allTooLarge = false
+			break
+		}
+	}
+	if allTooLarge {
+		return nil, types.ProviderConfig{}, fmt.Errorf("%w: %s", ErrRequestTooLarge, strings.Join(providerErrors, "; "))
 	}
 
 	return nil, types.ProviderConfig{}, fmt.Errorf("all providers failed for plan %s: %s", planSlug, strings.Join(providerErrors, "; "))
