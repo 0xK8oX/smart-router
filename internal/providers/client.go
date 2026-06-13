@@ -49,6 +49,11 @@ func buildEndpoint(baseURL string, format string) string {
 	return base + "/v1/chat/completions"
 }
 
+// buildModelsEndpoint returns the upstream /v1/models URL for a provider.
+func buildModelsEndpoint(baseURL string) string {
+	return strings.TrimSuffix(baseURL, "/") + "/v1/models"
+}
+
 func isKimiCodingEndpoint(baseURL string) bool {
 	return strings.Contains(baseURL, "api.kimi.com") && strings.Contains(baseURL, "/coding")
 }
@@ -153,4 +158,43 @@ func (c *Client) CallStream(ctx context.Context, provider types.ProviderConfig, 
 	}
 	streamBody["stream"] = true
 	return c.doRequest(ctx, provider, streamBody, headers)
+}
+
+// FetchModels calls a provider's /v1/models endpoint and returns the raw JSON
+// bytes. It uses a short timeout and never retries.
+func (c *Client) FetchModels(ctx context.Context, provider types.ProviderConfig) ([]byte, error) {
+	timeout := 5 * time.Second
+	if provider.Timeout > 0 {
+		timeout = time.Duration(provider.Timeout) * time.Second
+		if timeout > 5*time.Second {
+			timeout = 5 * time.Second
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	endpoint := buildModelsEndpoint(provider.BaseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create models request: %w", err)
+	}
+	if isNativeAnthropic(provider.BaseURL) {
+		req.Header.Set("x-api-key", provider.APIKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+	} else if isKimiCodingEndpoint(provider.BaseURL) {
+		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+		req.Header.Set("User-Agent", "claude-code/0.1.0")
+	} else {
+		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upstream status %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 }

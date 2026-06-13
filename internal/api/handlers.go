@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -562,13 +561,6 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 
 	resp, provider, err := s.router.Route(r.Context(), planSlug, body, isStreaming, clientFormat, r.Header, clientKey)
 	if err != nil {
-		// Request too large for all providers — return 413 with clear
-		// instruction to run /compact.
-		if errors.Is(err, router.ErrRequestTooLarge) {
-			w.Header().Set("X-Recovery", "run /compact to shrink conversation")
-			writeError(w, r, http.StatusRequestEntityTooLarge, "Request exceeds all providers' context limits. Run /compact to shrink the conversation, or start a new session.")
-			return
-		}
 		writeError(w, r, http.StatusServiceUnavailable, err.Error())
 		return
 	}
@@ -677,17 +669,155 @@ var defaultModels = []map[string]interface{}{
 	{"type": "model", "id": "auto-kato", "display_name": "Auto Kato", "created_at": "2026-04-01T00:00:00Z", "context_window": 262144, "max_output_tokens": 98304},
 }
 
+// distinctProviderURLs returns a deduplicated list of providers keyed by
+// base_url, one representative provider per URL (first seen). Used to fan
+// out /v1/models probes without hammering the same upstream multiple times.
+func (s *Server) distinctProviderURLs() []types.ProviderConfig {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	plans, err := s.db.ListPlans()
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []types.ProviderConfig
+	for _, plan := range plans {
+		for _, p := range plan.Providers {
+			if p.BaseURL == "" {
+				continue
+			}
+			key := strings.TrimSuffix(p.BaseURL, "/")
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// fetchProviderModels hits a single provider's /v1/models and parses the
+// "data" array. Returns nil on any error.
+func (s *Server) fetchProviderModels(ctx context.Context, p types.ProviderConfig) []map[string]interface{} {
+	if s == nil || s.router == nil {
+		return nil
+	}
+	data, err := s.router.Client().FetchModels(ctx, p)
+	if err != nil {
+		return nil
+	}
+	var envelope struct {
+		Data []map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(envelope.Data))
+	for _, m := range envelope.Data {
+		id, _ := m["id"].(string)
+		if id == "" {
+			continue
+		}
+		// Normalize into a stable shape so consumers see a consistent set of fields.
+		normalized := map[string]interface{}{
+			"id":   id,
+			"type": "model",
+		}
+		if v, ok := m["display_name"].(string); ok {
+			normalized["display_name"] = v
+		} else if v, ok := m["name"].(string); ok {
+			normalized["display_name"] = v
+		}
+		if v, ok := m["created_at"].(string); ok {
+			normalized["created_at"] = v
+		}
+		if v, ok := m["context_window"].(float64); ok {
+			normalized["context_window"] = int(v)
+		} else if v, ok := m["context_length"].(float64); ok {
+			normalized["context_window"] = int(v)
+		}
+		if v, ok := m["max_output_tokens"].(float64); ok {
+			normalized["max_output_tokens"] = int(v)
+		} else if v, ok := m["max_tokens"].(float64); ok {
+			normalized["max_output_tokens"] = int(v)
+		}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+// fetchAllProviderModels fans out /v1/models across all configured providers
+// in parallel. Returns merged unique models keyed by id. If all probes fail,
+// the result is nil and the caller should fall back to the static list.
+func (s *Server) fetchAllProviderModels(ctx context.Context) []map[string]interface{} {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	providers := s.distinctProviderURLs()
+	if len(providers) == 0 {
+		return nil
+	}
+
+	results := make([][]map[string]interface{}, len(providers))
+	var wg sync.WaitGroup
+	for i, p := range providers {
+		wg.Add(1)
+		go func(i int, p types.ProviderConfig) {
+			defer wg.Done()
+			results[i] = s.fetchProviderModels(ctx, p)
+		}(i, p)
+	}
+	wg.Wait()
+
+	merged := map[string]map[string]interface{}{}
+	order := []string{}
+	for _, r := range results {
+		if r == nil {
+			continue
+		}
+		for _, m := range r {
+			id, _ := m["id"].(string)
+			if id == "" {
+				continue
+			}
+			if _, ok := merged[id]; !ok {
+				order = append(order, id)
+			}
+			merged[id] = m
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(merged))
+	for _, id := range order {
+		out = append(out, merged[id])
+	}
+	return out
+}
+
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	merged := s.fetchAllProviderModels(r.Context())
+	models := merged
+	if models == nil {
+		// All probes failed — fall back to the static list.
+		models = defaultModels
+	} else {
+		// Always include the static virtual models (auto-*) on top.
+		models = append(models, defaultModels...)
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"data":     defaultModels,
+		"data":     models,
 		"object":   "list",
 		"has_more": false,
-		"first_id": defaultModels[0]["id"],
-		"last_id":  defaultModels[len(defaultModels)-1]["id"],
+		"first_id": firstID(models),
+		"last_id":  lastID(models),
 	})
 }
 
@@ -703,7 +833,32 @@ func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	merged := s.fetchAllProviderModels(r.Context())
+	if merged != nil {
+		for _, m := range merged {
+			if m["id"] == id {
+				writeJSON(w, http.StatusOK, m)
+				return
+			}
+		}
+	}
 	writeError(w, r, http.StatusNotFound, "model not found")
+}
+
+func firstID(models []map[string]interface{}) string {
+	if len(models) == 0 {
+		return ""
+	}
+	id, _ := models[0]["id"].(string)
+	return id
+}
+
+func lastID(models []map[string]interface{}) string {
+	if len(models) == 0 {
+		return ""
+	}
+	id, _ := models[len(models)-1]["id"].(string)
+	return id
 }
 
 func (s *Server) handleListPlans(w http.ResponseWriter, r *http.Request) {

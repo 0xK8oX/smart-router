@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -330,6 +331,90 @@ func TestHandleGetModel_NotFound(t *testing.T) {
 	}
 	if !strings.Contains(errObj["message"].(string), "model not found") {
 		t.Errorf("expected 'model not found' error, got %q", resp["error"])
+	}
+}
+
+func TestHandleListModels_MergesProviderAndStatic(t *testing.T) {
+	// Upstream server returns a single model.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"data":[{"id":"upstream-model","display_name":"Upstream Model","created_at":"2026-01-01T00:00:00Z","context_window":12345,"max_output_tokens":6789}],"object":"list"}`)
+	}))
+	defer upstream.Close()
+
+	database := setupTestDB(t)
+	_ = database.SavePlan("probe-plan", types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "stub", BaseURL: upstream.URL, Format: "openai", APIKey: "sk-test", Timeout: 30},
+		},
+	})
+
+	_, router := setupTestServer(t, database)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "upstream-model") {
+		t.Errorf("expected merged list to include upstream-model, got %s", body)
+	}
+	if !strings.Contains(body, "auto-jason") {
+		t.Errorf("expected merged list to include static auto-jason, got %s", body)
+	}
+}
+
+func TestHandleListModels_FallsBackToStaticOnAllProbesFail(t *testing.T) {
+	// All providers point at an unreachable port to force every probe to fail.
+	database := setupTestDB(t)
+	_ = database.SavePlan("broken-plan", types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "broken", BaseURL: "http://127.0.0.1:1", Format: "openai", APIKey: "sk-test", Timeout: 1},
+		},
+	})
+
+	_, router := setupTestServer(t, database)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "auto-jason") {
+		t.Errorf("expected fallback to include static auto-jason, got %s", body)
+	}
+}
+
+func TestHandleGetModel_FindsUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"data":[{"id":"upstream-only","display_name":"Upstream Only"}],"object":"list"}`)
+	}))
+	defer upstream.Close()
+
+	database := setupTestDB(t)
+	_ = database.SavePlan("probe-plan-2", types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "stub", BaseURL: upstream.URL, Format: "openai", APIKey: "sk-test", Timeout: 30},
+		},
+	})
+
+	_, router := setupTestServer(t, database)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models/upstream-only", nil)
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
