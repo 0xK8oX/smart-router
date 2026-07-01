@@ -340,7 +340,7 @@ func ClassifyFailure(status int, message string) string {
 	if status == 401 || strings.Contains(msg, "authentication") || strings.Contains(msg, "unauthorized") {
 		return "auth"
 	}
-	if status == 402 || strings.Contains(msg, "quota") || strings.Contains(msg, "credit") || strings.Contains(msg, "billing") {
+	if status == 402 || strings.Contains(msg, "quota") || strings.Contains(msg, "credit") || strings.Contains(msg, "billing") || strings.Contains(msg, "subscription") || strings.Contains(msg, "expired") {
 		return "quota"
 	}
 	if status == 429 || strings.Contains(msg, "rate limit") {

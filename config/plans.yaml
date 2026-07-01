@@ -39,3 +39,18 @@ plans:
         timeout: 60
         weight: 1
         enabled: true
+
+  local:
+    name: "Local LLM (llama.cpp Qwythos)"
+    strategy: "latency"
+    rate_limit_rpm: 60
+    rate_limit_rpd: 1000
+    providers:
+      - name: "qwythos-local"
+        base_url: "http://192.168.31.112:23456/v1"
+        model: "Qwythos"
+        format: "openai"
+        api_key: "sk-local"
+        timeout: 120
+        weight: 1
+        enabled: true

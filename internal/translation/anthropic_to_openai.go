@@ -6,8 +6,25 @@ import (
 	"strings"
 )
 
-// TranslateAnthropicRequestToOpenAI converts an Anthropic Messages API request
-// to OpenAI Chat Completions format.
+// anthropicSystemText extracts plain text from an Anthropic system message
+// content field (a string, or an array of {type:"text", text:"..."} blocks).
+func anthropicSystemText(content interface{}) string {
+	switch s := content.(type) {
+	case string:
+		return s
+	case []interface{}:
+		var parts []string
+		for _, p := range s {
+			if pm, ok := p.(map[string]interface{}); ok {
+				if text, ok := pm["text"].(string); ok {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return stringify(content)
+}
 func TranslateAnthropicRequestToOpenAI(body map[string]interface{}) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 
@@ -178,6 +195,19 @@ func TranslateAnthropicRequestToOpenAI(body map[string]interface{}) (map[string]
 				}
 
 			default:
+				// Mid-conversation system messages (e.g. Claude Code's
+				// <system-reminder> injections) must not become role:system here:
+				// many OpenAI chat templates (Claude-Mythos on llama.cpp, etc.)
+				// require the system message to be strictly first and raise
+				// "System message must be at the beginning". Render them as user
+				// messages so they stay in position without violating that.
+				if role == "system" {
+					messages = append(messages, map[string]interface{}{
+						"role":    "user",
+						"content": anthropicSystemText(content),
+					})
+					continue
+				}
 				messages = append(messages, msg)
 			}
 		}
@@ -216,7 +246,7 @@ func TranslateAnthropicRequestToOpenAI(body map[string]interface{}) (map[string]
 	if tcRaw, ok := body["tool_choice"]; ok {
 		switch tc := tcRaw.(type) {
 		case map[string]interface{}:
-			 tcType, _ := tc["type"].(string)
+			tcType, _ := tc["type"].(string)
 			switch tcType {
 			case "auto":
 				result["tool_choice"] = "auto"
@@ -260,12 +290,12 @@ func TranslateOpenAIResponseToAnthropic(data []byte) ([]byte, error) {
 		Model   string `json:"model"`
 		Created int64  `json:"created"`
 		Choices []struct {
-			Index        int `json:"index"`
+			Index        int    `json:"index"`
 			FinishReason string `json:"finish_reason"`
 			Message      struct {
-				Role       string `json:"role"`
-				Content    interface{} `json:"content"`
-				ToolCalls  []struct {
+				Role      string      `json:"role"`
+				Content   interface{} `json:"content"`
+				ToolCalls []struct {
 					ID       string `json:"id"`
 					Type     string `json:"type"`
 					Function struct {
@@ -317,9 +347,9 @@ func TranslateOpenAIResponseToAnthropic(data []byte) ([]byte, error) {
 			_ = json.Unmarshal([]byte(tc.Function.Arguments), &input)
 		}
 		content = append(content, map[string]interface{}{
-			"type": "tool_use",
-			"id":   tc.ID,
-			"name": tc.Function.Name,
+			"type":  "tool_use",
+			"id":    tc.ID,
+			"name":  tc.Function.Name,
 			"input": input,
 		})
 	}

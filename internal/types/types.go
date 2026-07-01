@@ -1,19 +1,24 @@
 package types
 
 type ProviderConfig struct {
-	Name              string  `json:"name" yaml:"name"`
-	BaseURL           string  `json:"base_url" yaml:"base_url"`
-	Model             string  `json:"model" yaml:"model"`
-	Format            string  `json:"format" yaml:"format"`
-	Timeout           int     `json:"timeout" yaml:"timeout"`
-	APIKey            string  `json:"api_key,omitempty" yaml:"api_key,omitempty"`
-	MaskedKey         string  `json:"masked_key,omitempty" yaml:"masked_key,omitempty"`
-	WeeklyTokenLimit  *uint64 `json:"weekly_token_limit,omitempty" yaml:"weekly_token_limit,omitempty"`
-	WeeklyReqLimit    *uint64 `json:"weekly_request_limit,omitempty" yaml:"weekly_request_limit,omitempty"`
-	ContextLength     *int    `json:"context_length,omitempty" yaml:"context_length,omitempty"`
-	MaxOutputTokens   *int    `json:"max_output_tokens,omitempty" yaml:"max_output_tokens,omitempty"`
-	MaxConcurrency    *int    `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty"`
-	Weight            int     `json:"weight,omitempty" yaml:"weight,omitempty"`
+	Name    string `json:"name" yaml:"name"`
+	BaseURL string `json:"base_url" yaml:"base_url"`
+	Model   string `json:"model" yaml:"model"`
+	Format  string `json:"format" yaml:"format"`
+	// Endpoints maps a request format ("anthropic"/"openai") to a provider URL.
+	// When set, the router picks endpoints[clientFormat] so a provider that offers
+	// both APIs is hit in the client's native format (passthrough, no translation).
+	// Falls back to BaseURL/Format when no matching endpoint is declared.
+	Endpoints        map[string]string `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
+	Timeout          int               `json:"timeout" yaml:"timeout"`
+	APIKey           string            `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	MaskedKey        string            `json:"masked_key,omitempty" yaml:"masked_key,omitempty"`
+	WeeklyTokenLimit *uint64           `json:"weekly_token_limit,omitempty" yaml:"weekly_token_limit,omitempty"`
+	WeeklyReqLimit   *uint64           `json:"weekly_request_limit,omitempty" yaml:"weekly_request_limit,omitempty"`
+	ContextLength    *int              `json:"context_length,omitempty" yaml:"context_length,omitempty"`
+	MaxOutputTokens  *int              `json:"max_output_tokens,omitempty" yaml:"max_output_tokens,omitempty"`
+	MaxConcurrency   *int              `json:"max_concurrency,omitempty" yaml:"max_concurrency,omitempty"`
+	Weight           int               `json:"weight,omitempty" yaml:"weight,omitempty"`
 }
 
 type PlanConfig struct {

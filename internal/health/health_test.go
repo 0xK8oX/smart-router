@@ -36,6 +36,8 @@ func TestClassifyFailure(t *testing.T) {
 		{0, "quota exceeded", "quota"},
 		{0, "credit exhausted", "quota"},
 		{0, "billing issue", "quota"},
+		{400, "InvalidSubscription: does not have a valid CodingPlan subscription", "quota"},
+		{400, "your subscription has expired", "quota"},
 		{429, "too many requests", "rate_limit"},
 		{0, "rate limit hit", "rate_limit"},
 		{500, "internal server error", "server_error"},

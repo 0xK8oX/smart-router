@@ -174,6 +174,7 @@ func (b *Bot) cmdPlan(args []string) string {
 
 	var lines []string
 	lines = append(lines, fmt.Sprintf("*Plan: %s*", slug))
+	lines = append(lines, fmt.Sprintf("Strategy: %s", plan.Strategy))
 	lines = append(lines, fmt.Sprintf("Providers: %d", len(plan.Providers)))
 
 	for _, p := range plan.Providers {

@@ -41,12 +41,25 @@ func NewClient() *Client {
 }
 
 func buildEndpoint(baseURL string, format string) string {
-	base := strings.TrimSuffix(baseURL, "/")
-	base = strings.TrimSuffix(base, "/v1")
-	if format == "anthropic" {
-		return base + "/v1/messages"
+	trimmed := strings.TrimSuffix(baseURL, "/")
+	// If the URL already ends in a known API path, treat it as fully specified
+	// and return it verbatim. This lets providers with non-OpenAI path
+	// conventions (e.g. bigmodel's /api/paas/v4/chat/completions) declare their
+	// exact endpoint URL without needing buildEndpoint to guess.
+	for _, suffix := range []string{"/chat/completions", "/messages", "/responses", "/completions"} {
+		if strings.HasSuffix(trimmed, suffix) {
+			return trimmed
+		}
 	}
-	return base + "/v1/chat/completions"
+	base := strings.TrimSuffix(trimmed, "/v1")
+	switch format {
+	case "anthropic":
+		return base + "/v1/messages"
+	case "responses":
+		return base + "/v1/responses"
+	default:
+		return base + "/v1/chat/completions"
+	}
 }
 
 // buildModelsEndpoint returns the upstream /v1/models URL for a provider.
