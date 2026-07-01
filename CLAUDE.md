@@ -66,24 +66,35 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## Project: smart-router
 
-A Go-based LLM API router that proxies requests between OpenAI and Anthropic formats, with plan-based provider failover, health tracking, and stats collection.
+A Go-based LLM API router that proxies requests across OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages formats, with plan-based provider failover, native multi-endpoint routing, health tracking, and stats collection.
 
 ### Architecture
 
 **Plan-based routing:**
 - Plans are stored in SQLite (`internal/db/db.go`). Each plan has an ordered list of providers.
-- `internal/router/router.go` loads the plan, iterates providers in order, checks health, translates request format if needed, and calls the provider.
-- Provider config includes: `name`, `base_url`, `model`, `format` ("openai" or "anthropic"), `api_key`, `timeout`.
+- `internal/router/router.go` loads the plan, iterates providers in order, checks health, resolves the effective endpoint, translates request format if needed, and calls the provider.
+- Provider config includes: `name`, `base_url`, `model`, `format` ("openai", "anthropic", or "responses"), `api_key`, `timeout`, and optionally `endpoints` (see Multi-endpoint providers below).
 
 **Format-aware passthrough:**
-- When `clientFormat == provider.Format`, the router acts as a transparent proxy: only the `model` field and auth headers are changed. All other headers and body fields pass through unchanged.
+- When the effective provider format matches `clientFormat`, the router acts as a transparent proxy: only the `model` field and auth headers are changed. All other headers and body fields pass through unchanged.
 - When formats differ, full translation happens (`internal/translation/`).
+- `routeWithDepth` returns the **effective** provider (resolved format/URL), not the declared one — handlers branch on the format actually used upstream.
+
+**Format-affinity routing:**
+- `providerScore` gives a bonus to providers whose effective format matches `clientFormat`, so the router prefers passthrough over translation when both are healthy. Provider ordering is shared by `ResolveProvider` (precheck) and `routeWithDepth` (actual call) via `buildOrderedProviders`, so the two never disagree on order.
 
 **Translation layer (`internal/translation/`):**
 - `translate.go` — `TranslateRequest` and `TranslateResponse` between OpenAI and Anthropic formats.
 - `anthropic_to_openai.go` — Anthropic Messages API ↔ OpenAI Chat Completions.
 - `openai_to_anthropic_stream.go` — SSE streaming translation OpenAI → Anthropic.
 - `streaming.go` — SSE streaming translation Anthropic → OpenAI.
+- `responses.go` / `responses_stream.go` — Responses API ↔ Chat Completions conversion (used at the `/v1/responses` edge; `Route` itself never sees a `responses ↔ openai` pair).
+
+**Multi-endpoint providers (`endpoints` field):**
+- A provider can declare `endpoints: { anthropic: <url>, openai: <url>, responses: <url> }` to expose multiple APIs from one entry. The router resolves `endpoints[clientFormat]` (`resolveEndpoint`) and hits it natively (passthrough, no translation).
+- Example (MiniMax, which offers all three): one `jason-minimax` provider with `endpoints: {anthropic: .../anthropic, openai: .../v1, responses: .../v1}`.
+- Providers without `endpoints` keep using `base_url`/`format`.
+- When a client requests a format no provider in the plan can serve natively (e.g. `responses` with no `responses` endpoint declared), the handler falls back to edge translation (Responses ↔ Chat Completions). The router skips non-matching providers without marking them unhealthy.
 
 **Key quirk:** Kimi's Anthropic-format API returns `input_tokens: 0` alongside `prompt_tokens: N`. The translation layer (`translateAnthropicToOpenAI`) falls back to `prompt_tokens`/`completion_tokens` when the Anthropic-style fields are zero.
 
@@ -100,16 +111,18 @@ A Go-based LLM API router that proxies requests between OpenAI and Anthropic for
 **Provider client (`internal/providers/client.go`):**
 - `Call` — non-streaming, with timeout context.
 - `CallStream` — streaming, no hard timeout (uses `context.Background()`).
-- Headers are forwarded from the original request only when `clientFormat == provider.Format` (passthrough mode).
+- Headers are forwarded from the original request only when `clientFormat == eff.Format` (passthrough mode).
 - Auth header format varies by provider: `x-api-key` for native Anthropic, `Authorization: Bearer` for others. Kimi coding gets a custom `User-Agent`.
+- `buildEndpoint` appends `/v1/messages`, `/v1/responses`, or `/v1/chat/completions` based on format. **Special case:** if the URL already ends in a known API path (`/chat/completions`, `/messages`, `/responses`, `/completions`), it is used verbatim — this lets providers with non-standard paths (e.g. bigmodel's `/api/paas/v4/chat/completions`) declare their exact URL.
 
 ### Endpoints
 
 The server (`internal/api/handlers.go`) exposes:
-- `POST /v1/chat/completions` — OpenAI format in/out
-- `POST /v1/messages` — Anthropic format in/out
+- `POST /v1/chat/completions` — OpenAI Chat Completions format in/out
+- `POST /v1/messages` — Anthropic Messages format in/out
+- `POST /v1/responses` — OpenAI Responses API (for Codex). If the selected provider declares a `responses` endpoint, the raw body is proxied natively; otherwise it converts Responses ↔ Chat Completions at the edge.
 - `GET /v1/models`, `GET /v1/models/{id}` — static model list for Claude Code compatibility
-- `GET/PUT/DELETE /v1/plans/{slug}` — plan management
+- `GET/PUT/DELETE /v1/plans/{slug}` — plan management (responses always mask API keys, even for admin callers)
 - `GET /v1/health`, `GET /v1/health/activity` — health checks
 - `GET /v1/stats`, `GET /v1/stats/aggregated` — stats queries
 
@@ -133,10 +146,11 @@ cd /Volumes/Proj/workspace/smart-router && go build -o smart-router . && pm2 res
 
 | File | Responsibility |
 |------|----------------|
-| `internal/router/router.go` | Plan loading, provider iteration, health checks, format decision |
-| `internal/api/handlers.go` | HTTP handlers, token extraction, stat recording, streaming loops |
-| `internal/providers/client.go` | HTTP client for upstream providers, header forwarding, auth |
-| `internal/translation/translate.go` | Response translation Anthropic ↔ OpenAI, Kimi fallback |
+| `internal/router/router.go` | Plan loading, provider ordering (`buildOrderedProviders`), health checks, endpoint resolution (`resolveEndpoint`), format-affinity scoring |
+| `internal/api/handlers.go` | HTTP handlers (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), token extraction, key masking, stat recording, streaming loops |
+| `internal/providers/client.go` | HTTP client for upstream providers, `buildEndpoint` URL construction, header forwarding, auth |
+| `internal/translation/translate.go` | Request/response translation Anthropic ↔ OpenAI, Kimi fallback |
+| `internal/translation/responses.go` | Responses API ↔ Chat Completions conversion |
 | `internal/db/db.go` | SQLite: plans, stats, usage queries |
 | `internal/health/health.go` | BadgerDB: failure tracking, cooldown logic |
 | `internal/alerts/telegram.go` | Telegram bot commands |
@@ -174,8 +188,9 @@ Or via Telegram: `/reset <provider>`
 
 ### Common Pitfalls
 
-- **Tests fail after signature changes:** `Route`, `Call`, `CallStream`, `TranslateRequest` all take extra params now. Update test calls.
-- **Token counts are 0:** Check that `types.MaskAPIKey` is set in `KeyMask` and that the upstream response actually contains usage. Use `extractUsage` for non-streaming, `extractUsageFromStream` for streaming.
+- **Tests fail after signature changes:** `Route`, `ResolveProvider`, `Call`, `CallStream`, `TranslateRequest`, `providerScore` all take extra params now (notably `providerScore` takes `clientFormat` for the format-affinity bonus). Update test calls.
+- **Token counts are 0:** Check that `types.MaskAPIKey` is set in `KeyMask` and that the upstream response actually contains usage. Use `extractUsage` for non-streaming, `extractUsageFromStream` for streaming. Both handle `"responses"` (reads `input_tokens`/`output_tokens`).
 - **Streaming timeout:** `CallStream` must use `context.Background()`, not `context.WithTimeout`.
-- **Double `/v1` in URL:** Ensure `base_url` in config does NOT end with `/v1`. The client appends `/v1/messages` or `/v1/chat/completions`.
+- **Double `/v1` in URL:** Ensure `base_url` / `endpoints` in config does NOT end with `/v1` (unless the URL is a full API path — see `buildEndpoint` above). The client appends `/v1/messages`, `/v1/responses`, or `/v1/chat/completions`. For non-standard paths (bigmodel), give the full URL ending in `/chat/completions` so it's used verbatim.
 - **Anthropic `x-api-key` vs `Authorization`:** Native Anthropic (`api.anthropic.com`) uses `x-api-key`. Most proxies use `Authorization: Bearer`.
+- **Empty/wrong response after multi-endpoint:** `Route` returns the *effective* provider. Handlers must branch on the returned `provider.Format` (effective), not the declared format — otherwise a passthrough response gets mistranslated.
