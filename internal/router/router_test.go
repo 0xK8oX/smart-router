@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1644,26 +1645,19 @@ func TestRouteAdaptiveStrategy(t *testing.T) {
 	}
 }
 
-
-func TestRouteTokenLimitFallback(t *testing.T) {
-	// Two providers: small (returns 400 token limit) and large (succeeds).
+func TestRouteTokenLimitPassedThrough(t *testing.T) {
+	// Token-limit errors should be returned to the client as-is, not retried
+	// on other providers (they share the same context window).
 	smallServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"Invalid request: Your request exceeded model token limit: 262144 (requested: 477883)"}}`))
+		w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"Invalid request: Your request exceeded model token limit: 262144 (requested: 477883)"},"type":"error"}`))
 	}))
 	defer smallServer.Close()
 
-	largeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"id":"large","object":"chat.completion","choices":[]}`))
-	}))
-	defer largeServer.Close()
-
-	sqlitePath := "/tmp/test_router_token_fallback.db"
+	sqlitePath := "/tmp/test_router_token_passthrough.db"
 	_ = os.Remove(sqlitePath)
-	badgerDir, _ := os.MkdirTemp("", "router-token-fallback-*")
+	badgerDir, _ := os.MkdirTemp("", "router-token-passthrough-*")
 	defer os.RemoveAll(badgerDir)
 	defer os.Remove(sqlitePath)
 
@@ -1676,10 +1670,9 @@ func TestRouteTokenLimitFallback(t *testing.T) {
 		Strategy: "round_robin",
 		Providers: []types.ProviderConfig{
 			{Name: "small", Model: "k2p6", BaseURL: smallServer.URL, Format: "openai", APIKey: "sk-small", Timeout: 30},
-			{Name: "large", Model: "k2p6", BaseURL: largeServer.URL, Format: "openai", APIKey: "sk-large", Timeout: 30},
 		},
 	}
-	if err := database.SavePlan("fallback-plan", plan); err != nil {
+	if err := database.SavePlan("token-plan", plan); err != nil {
 		t.Fatalf("save plan: %v", err)
 	}
 
@@ -1689,18 +1682,379 @@ func TestRouteTokenLimitFallback(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, provider, err := router.Route(context.Background(), "fallback-plan", body, false, "openai", nil, "")
-	if err != nil {
-		t.Fatalf("expected fallback to succeed, got error: %v", err)
+	resp, _, err := router.Route(context.Background(), "token-plan", body, false, "openai", nil, "")
+	if err == nil {
+		t.Fatalf("expected UpstreamError, got nil")
 	}
-	if provider.Name != "large" {
-		t.Errorf("expected fallback to large provider, got %s", provider.Name)
+	ue, ok := err.(*UpstreamError)
+	if !ok {
+		t.Fatalf("expected *UpstreamError, got %T: %v", err, err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("expected 200 from large, got %d", resp.StatusCode)
+	if ue.Resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", ue.Resp.StatusCode)
 	}
-	resp.Body.Close()
+	if !strings.Contains(string(ue.Body), "exceeded model token limit") {
+		t.Errorf("expected token limit message, got %s", string(ue.Body))
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	// Provider should not be marked unhealthy for token-limit errors.
+	h, _ := ht.GetHealth("small")
+	if h.Status == "unhealthy" {
+		t.Errorf("expected provider to stay healthy after token-limit error, got %s", h.Status)
+	}
 }
 
-
 func intPtr(v int) *int { return &v }
+
+func TestProviderScore_FormatAffinityBonus(t *testing.T) {
+	// Two providers with the same latency profile. One has an openai endpoint
+	// (so it can serve an openai client natively), the other is anthropic-only.
+	// The openai-native one should score lower (better) for an openai request.
+	openaiNative := types.ProviderConfig{
+		Name: "native", Model: "m", BaseURL: "http://x", Format: "anthropic", Timeout: 5, APIKey: "sk",
+		Endpoints: map[string]string{"openai": "http://x/openai"},
+	}
+	anthropicOnly := types.ProviderConfig{
+		Name: "anth-only", Model: "m", BaseURL: "http://y", Format: "anthropic", Timeout: 5, APIKey: "sk",
+	}
+
+	sqlitePath := "/tmp/test_router_affinity.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-affinity-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health: %v", err)
+	}
+	defer ht.Close()
+	r := New(ht, database)
+
+	// Seed latency cache directly so both providers compare on equal footing.
+	r.latencyCache["native"] = 100
+	r.latencyCache["anth-only"] = 100
+
+	scoreNative := r.providerScore(openaiNative, "m", "openai")
+	scoreAnthropic := r.providerScore(anthropicOnly, "m", "openai")
+	if scoreNative >= scoreAnthropic {
+		t.Errorf("format-affinity bonus should make native (openai endpoint) score lower than anthropic-only; got native=%v anth=%v", scoreNative, scoreAnthropic)
+	}
+
+	// For an anthropic request, anthropic-only should score lower (or equal).
+	scoreNative2 := r.providerScore(openaiNative, "m", "anthropic")
+	scoreAnthropic2 := r.providerScore(anthropicOnly, "m", "anthropic")
+	if scoreAnthropic2 > scoreNative2 {
+		t.Errorf("for anthropic request, anthropic-only should score <= native (no bonus); got anth=%v native=%v", scoreAnthropic2, scoreNative2)
+	}
+
+	// Empty clientFormat disables the bonus (legacy callers / tests).
+	scoreNative3 := r.providerScore(openaiNative, "m", "")
+	scoreAnthropic3 := r.providerScore(anthropicOnly, "m", "")
+	if scoreNative3 != scoreAnthropic3 {
+		t.Errorf("empty clientFormat should produce equal scores; got native=%v anth=%v", scoreNative3, scoreAnthropic3)
+	}
+}
+
+func TestResolveEndpoint(t *testing.T) {
+	p := types.ProviderConfig{
+		Name: "x", BaseURL: "default", Format: "openai",
+		Endpoints: map[string]string{"anthropic": "http://a", "openai": "http://b"},
+	}
+	if got := resolveEndpoint(p, "anthropic"); got.BaseURL != "http://a" || got.Format != "anthropic" {
+		t.Errorf("anthropic match: base=%s format=%s", got.BaseURL, got.Format)
+	}
+	if got := resolveEndpoint(p, "openai"); got.BaseURL != "http://b" || got.Format != "openai" {
+		t.Errorf("openai match: base=%s format=%s", got.BaseURL, got.Format)
+	}
+	// unknown format -> default BaseURL/Format
+	if got := resolveEndpoint(p, "weird"); got.BaseURL != "default" || got.Format != "openai" {
+		t.Errorf("fallback: base=%s format=%s", got.BaseURL, got.Format)
+	}
+	// nil endpoints -> unchanged
+	p2 := types.ProviderConfig{Name: "x", BaseURL: "default", Format: "openai"}
+	if got := resolveEndpoint(p2, "anthropic"); got.BaseURL != "default" || got.Format != "openai" {
+		t.Errorf("nil endpoints: base=%s format=%s", got.BaseURL, got.Format)
+	}
+}
+
+func TestRouteMultiEndpointSelectsByFormat(t *testing.T) {
+	var aHits, bHits int
+	anthropicSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		aHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"a","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}`))
+	}))
+	defer anthropicSrv.Close()
+	openaiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"b","object":"chat.completion","choices":[]}`))
+	}))
+	defer openaiSrv.Close()
+
+	sqlitePath := "/tmp/test_router_multi.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-health-multi-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health: %v", err)
+	}
+	defer ht.Close()
+
+	if err := database.SavePlan("p", types.PlanConfig{
+		Providers: []types.ProviderConfig{{
+			Name: "multi", Model: "m", Format: "openai", Timeout: 5, APIKey: "sk-test",
+			Endpoints: map[string]string{"anthropic": anthropicSrv.URL, "openai": openaiSrv.URL},
+		}},
+	}); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+	router := New(ht, database)
+	body := map[string]interface{}{
+		"model":    "m",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+
+	// Anthropic request -> anthropic endpoint hit (passthrough, no translation).
+	resp, _, err := router.Route(context.Background(), "p", body, false, "anthropic", nil, "")
+	if err != nil {
+		t.Fatalf("anthropic route: %v", err)
+	}
+	resp.Body.Close()
+	if aHits != 1 || bHits != 0 {
+		t.Errorf("anthropic req: expected aHits=1 bHits=0, got a=%d b=%d", aHits, bHits)
+	}
+
+	// OpenAI request -> openai endpoint hit.
+	resp, _, err = router.Route(context.Background(), "p", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("openai route: %v", err)
+	}
+	resp.Body.Close()
+	if aHits != 1 || bHits != 1 {
+		t.Errorf("openai req: expected aHits=1 bHits=1, got a=%d b=%d", aHits, bHits)
+	}
+}
+
+// TestRouteReturnsEffectiveFormat is a regression test: Route must return the
+// effective provider (with the resolved Format), not the declared one. Handlers
+// branch on provider.Format to decide response translation; returning the
+// declared format causes a passthrough (openai-endpoint) response to be
+// mistranslated as anthropic->openai.
+func TestRouteReturnsEffectiveFormat(t *testing.T) {
+	openaiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"b","object":"chat.completion","choices":[]}`))
+	}))
+	defer openaiSrv.Close()
+
+	sqlitePath := "/tmp/test_router_efffmt.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-efffmt-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health: %v", err)
+	}
+	defer ht.Close()
+
+	// Declared format is anthropic, but it declares an openai endpoint. An
+	// openai client request should resolve to eff.Format == "openai".
+	if err := database.SavePlan("p", types.PlanConfig{
+		Providers: []types.ProviderConfig{{
+			Name: "multi", Model: "m", Format: "anthropic", Timeout: 5, APIKey: "sk-test",
+			Endpoints: map[string]string{"openai": openaiSrv.URL},
+		}},
+	}); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+	router := New(ht, database)
+	body := map[string]interface{}{
+		"model":    "m",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+
+	resp, provider, err := router.Route(context.Background(), "p", body, false, "openai", nil, "")
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	defer resp.Body.Close()
+	if provider.Format != "openai" {
+		t.Errorf("expected returned provider.Format == effective 'openai', got %q (declared anthropic)", provider.Format)
+	}
+}
+
+func TestResolveProvider_ResponsesEndpoint(t *testing.T) {
+	sqlitePath := "/tmp/test_router_resolve_responses.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-resolve-responses-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health: %v", err)
+	}
+	defer ht.Close()
+
+	if err := database.SavePlan("p", types.PlanConfig{
+		Strategy: "round_robin",
+		Providers: []types.ProviderConfig{
+			{Name: "no-resp", Model: "m", BaseURL: "http://no-resp", Format: "openai", Timeout: 5, APIKey: "sk-test"},
+			{Name: "with-resp", Model: "m", BaseURL: "http://anthropic", Format: "anthropic", Timeout: 5, APIKey: "sk-test",
+				Endpoints: map[string]string{"responses": "http://resp-endpoint"}},
+		},
+	}); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+	body := map[string]interface{}{"model": "m"}
+
+	eff, err := router.ResolveProvider(context.Background(), "p", body, "responses")
+	if err != nil {
+		t.Fatalf("ResolveProvider: %v", err)
+	}
+	if eff.Name != "with-resp" {
+		t.Errorf("expected with-resp, got %s", eff.Name)
+	}
+	if eff.Format != "responses" {
+		t.Errorf("expected format responses, got %s", eff.Format)
+	}
+	if eff.BaseURL != "http://resp-endpoint" {
+		t.Errorf("expected base URL http://resp-endpoint, got %s", eff.BaseURL)
+	}
+
+	// Unknown format -> error.
+	_, err = router.ResolveProvider(context.Background(), "p", body, "weird")
+	if err == nil {
+		t.Errorf("expected error for unsupported format, got nil")
+	}
+}
+
+func TestRoute_ResponsesEndpoint(t *testing.T) {
+	var receivedPath string
+	var receivedBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"resp_test","object":"response","output":[]}`))
+	}))
+	defer srv.Close()
+
+	sqlitePath := "/tmp/test_router_route_responses.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-route-responses-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health: %v", err)
+	}
+	defer ht.Close()
+
+	if err := database.SavePlan("p", types.PlanConfig{
+		Strategy: "round_robin",
+		Providers: []types.ProviderConfig{
+			{Name: "resp", Model: "m", BaseURL: srv.URL, Format: "openai", Timeout: 5, APIKey: "sk-test",
+				Endpoints: map[string]string{"responses": srv.URL}},
+		},
+	}); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+	resp, _, err := router.Route(context.Background(), "p", map[string]interface{}{"model": "m", "input": "hi"}, false, "responses", nil, "")
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	defer resp.Body.Close()
+	if receivedPath != "/v1/responses" {
+		t.Errorf("expected upstream path /v1/responses, got %s", receivedPath)
+	}
+	// The request body should be sent as-is (no translation to Chat Completions).
+	var reqBody map[string]interface{}
+	if err := json.Unmarshal(receivedBody, &reqBody); err != nil {
+		t.Fatalf("decode upstream body: %v", err)
+	}
+	if reqBody["input"] != "hi" {
+		t.Errorf("expected input field in body, got %v", reqBody)
+	}
+}
+
+// TestRoute_ResponsesNoEndpointDoesNotFailProvider is a regression test: a
+// responses-format request against a plan whose providers have no responses
+// endpoint must error out, but must NOT mark any provider unhealthy (they are
+// simply the wrong format, not failing).
+func TestRoute_ResponsesNoEndpointDoesNotFailProvider(t *testing.T) {
+	sqlitePath := "/tmp/test_router_resp_nofail.db"
+	_ = os.Remove(sqlitePath)
+	badgerDir, _ := os.MkdirTemp("", "router-resp-nofail-*")
+	defer os.RemoveAll(badgerDir)
+	defer os.Remove(sqlitePath)
+	database, err := db.Open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+	ht, err := health.New(badgerDir)
+	if err != nil {
+		t.Fatalf("open health: %v", err)
+	}
+	defer ht.Close()
+
+	if err := database.SavePlan("p", types.PlanConfig{
+		Strategy: "round_robin",
+		Providers: []types.ProviderConfig{
+			{Name: "openai-only", Model: "m", BaseURL: "http://openai", Format: "openai", Timeout: 5, APIKey: "sk-test"},
+		},
+	}); err != nil {
+		t.Fatalf("save plan: %v", err)
+	}
+
+	router := New(ht, database)
+	_, _, err = router.Route(context.Background(), "p", map[string]interface{}{"model": "m", "input": "hi"}, false, "responses", nil, "")
+	if err == nil {
+		t.Fatalf("expected error (no responses endpoint), got nil")
+	}
+
+	h, _ := ht.GetHealth("openai-only")
+	if h.Status == "unhealthy" {
+		t.Errorf("provider must NOT be marked unhealthy for a format mismatch, got %+v", h)
+	}
+}

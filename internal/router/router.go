@@ -21,6 +21,31 @@ import (
 	"smart-router/internal/types"
 )
 
+// UpstreamError indicates that a provider returned a non-retryable client error
+// that should be passed through to the client as-is.
+type UpstreamError struct {
+	Resp     *http.Response
+	Provider types.ProviderConfig
+	Body     []byte
+}
+
+func (e *UpstreamError) Error() string {
+	return fmt.Sprintf("upstream error from %s: HTTP %d", e.Provider.Name, e.Resp.StatusCode)
+}
+
+// isRequestTooLarge detects provider errors where the request exceeds the
+// model's context window. These should not mark the provider unhealthy and
+// should be returned to the client rather than retried on another provider.
+func isRequestTooLarge(status int, body string) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	msg := strings.ToLower(body)
+	return strings.Contains(msg, "exceeded model token limit") ||
+		strings.Contains(msg, "token limit") ||
+		strings.Contains(msg, "context window")
+}
+
 type cachedPlan struct {
 	plan     *types.PlanConfig
 	loadedAt time.Time
@@ -262,6 +287,20 @@ func extractPlanFromURL(baseURL string) string {
 	return baseURL[len(smartPrefix):]
 }
 
+// resolveEndpoint returns a copy of p with BaseURL/Format set to the endpoint
+// matching clientFormat when one is declared. This lets a provider that offers
+// both an anthropic and an openai API be hit in the client's native format
+// (passthrough, no translation). Falls back to p's default BaseURL/Format.
+func resolveEndpoint(p types.ProviderConfig, clientFormat string) types.ProviderConfig {
+	if p.Endpoints != nil {
+		if url, ok := p.Endpoints[clientFormat]; ok && url != "" {
+			p.BaseURL = url
+			p.Format = clientFormat
+		}
+	}
+	return p
+}
+
 // Route finds a healthy provider, calls it, and returns the response.
 // getInFlight returns the atomic counter for a provider, lazily initialising if needed.
 func (r *Router) getInFlight(name string) *atomic.Int32 {
@@ -305,8 +344,11 @@ func (r *Router) getLatency(provider string) int64 {
 }
 
 // providerScore returns a lower-is-better score for adaptive routing.
-// Factors: latency, in-flight ratio, same-model bonus.
-func (r *Router) providerScore(p types.ProviderConfig, requestedModel string) float64 {
+// Factors: latency, in-flight ratio, same-model bonus, and format-affinity
+// bonus (preferring providers that can serve the request in the client's
+// native format — i.e. passthrough — over providers that would require
+// format translation).
+func (r *Router) providerScore(p types.ProviderConfig, requestedModel, clientFormat string) float64 {
 	score := float64(r.getLatency(p.Name))
 
 	// In-flight penalty. Providers with higher max_concurrency can absorb more load.
@@ -328,6 +370,16 @@ func (r *Router) providerScore(p types.ProviderConfig, requestedModel string) fl
 		score *= 0.7
 	}
 
+	// Format-affinity bonus: prefer providers whose effective format matches
+	// the client's request format, so the request is forwarded as-is instead
+	// of being translated at the edge. When multiple providers share the
+	// requested model, this picks the one that avoids translation.
+	if clientFormat != "" {
+		if resolveEndpoint(p, clientFormat).Format == clientFormat {
+			score *= 0.8
+		}
+	}
+
 	return score
 }
 
@@ -339,6 +391,71 @@ func extractSource(headers http.Header) string {
 // extractUserAgent returns the raw User-Agent header for stats.
 func extractUserAgent(headers http.Header) string {
 	return headers.Get("User-Agent")
+}
+
+// buildOrderedProviders returns plan.Providers in routing order for the given
+// requested model and client format. Adaptive strategy sorts all providers by
+// providerScore; other strategies put same-model providers first, then apply
+// the configured strategy to the rest. Shared by ResolveProvider (precheck)
+// and routeWithDepth (actual call) so the two always agree on order.
+func (r *Router) buildOrderedProviders(plan *types.PlanConfig, planSlug, requestedModel, clientFormat string) []types.ProviderConfig {
+	if plan.Strategy == "adaptive" {
+		ordered := make([]types.ProviderConfig, len(plan.Providers))
+		copy(ordered, plan.Providers)
+		sort.Slice(ordered, func(i, j int) bool {
+			return r.providerScore(ordered[i], requestedModel, clientFormat) <
+				r.providerScore(ordered[j], requestedModel, clientFormat)
+		})
+		return ordered
+	}
+	var ordered, remaining []types.ProviderConfig
+	for _, p := range plan.Providers {
+		if p.Model == requestedModel {
+			ordered = append(ordered, p)
+		} else {
+			remaining = append(remaining, p)
+		}
+	}
+	remaining = r.applyStrategy(planSlug, plan.Strategy, remaining)
+	return append(ordered, remaining...)
+}
+
+// ResolveProvider selects the first healthy provider for the given plan and
+// client format, applying endpoint resolution. It does not make an upstream
+// call. The caller can inspect eff.Format to decide whether native passthrough
+// is available (e.g. eff.Format == "responses" means the provider has a
+// declared responses endpoint).
+func (r *Router) ResolveProvider(ctx context.Context, planSlug string, body map[string]interface{}, clientFormat string) (types.ProviderConfig, error) {
+	plan, err := r.getPlanCached(planSlug)
+	if err != nil {
+		return types.ProviderConfig{}, fmt.Errorf("load plan: %w", err)
+	}
+	if plan == nil {
+		return types.ProviderConfig{}, fmt.Errorf("plan not found: %s", planSlug)
+	}
+
+	requestedModel, _ := body["model"].(string)
+	now := time.Now().Unix()
+
+	orderedProviders := r.buildOrderedProviders(plan, planSlug, requestedModel, clientFormat)
+
+	for _, provider := range orderedProviders {
+		if isVirtualProvider(provider.BaseURL) {
+			continue
+		}
+		h, err := r.healthTracker.GetHealth(provider.Name)
+		if err != nil {
+			continue
+		}
+		if h.Status == "unhealthy" && h.CooldownUntil > now {
+			continue
+		}
+		eff := resolveEndpoint(provider, clientFormat)
+		if eff.Format == clientFormat {
+			return eff, nil
+		}
+	}
+	return types.ProviderConfig{}, fmt.Errorf("no healthy provider supports format %s for plan %s", clientFormat, planSlug)
 }
 
 func (r *Router) Route(ctx context.Context, planSlug string, body map[string]interface{}, isStreaming bool, clientFormat string, headers http.Header, clientKey string) (*http.Response, types.ProviderConfig, error) {
@@ -424,28 +541,7 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 	var providerErrors []string
 	now := time.Now().Unix()
 
-
-	// Build ordered provider list.
-	var orderedProviders []types.ProviderConfig
-	if plan.Strategy == "adaptive" {
-		orderedProviders = make([]types.ProviderConfig, len(plan.Providers))
-		copy(orderedProviders, plan.Providers)
-		sort.Slice(orderedProviders, func(i, j int) bool {
-			return r.providerScore(orderedProviders[i], requestedModel) <
-				r.providerScore(orderedProviders[j], requestedModel)
-		})
-	} else {
-		var remaining []types.ProviderConfig
-		for _, p := range plan.Providers {
-			if p.Model == requestedModel {
-				orderedProviders = append(orderedProviders, p)
-			} else {
-				remaining = append(remaining, p)
-			}
-		}
-		remaining = r.applyStrategy(planSlug, plan.Strategy, remaining)
-		orderedProviders = append(orderedProviders, remaining...)
-	}
+	orderedProviders := r.buildOrderedProviders(plan, planSlug, requestedModel, clientFormat)
 
 	for _, provider := range orderedProviders {
 		// Virtual provider: route internally to another plan instead of making an HTTP call.
@@ -496,8 +592,22 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 		}
 		translatedBody["model"] = provider.Model
 
+		// Resolve effective endpoint for this request format: if the provider
+		// declares an endpoint matching clientFormat, use it (passthrough, no
+		// translation); otherwise fall back to its default BaseURL/Format.
+		eff := resolveEndpoint(provider, clientFormat)
+
+		// Skip providers that can't serve the requested format natively and
+		// have no valid translation (only openai<->anthropic is translatable;
+		// "responses" requires a declared responses endpoint). Skipping without
+		// RecordFailure avoids wrongly marking a healthy provider unhealthy.
+		if clientFormat == "responses" && eff.Format != "responses" {
+			providerErrors = append(providerErrors, fmt.Sprintf("%s: no responses endpoint", provider.Name))
+			continue
+		}
+
 		// Translate request
-		translatedBody, err = translation.TranslateRequest(translatedBody, clientFormat, provider.Format)
+		translatedBody, err = translation.TranslateRequest(translatedBody, clientFormat, eff.Format)
 		if err != nil {
 			// Translation error is fatal for this provider, try next
 			_ = r.healthTracker.RecordFailure(provider.Name, 0, err.Error())
@@ -523,7 +633,7 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 
 		var resp *http.Response
 		var fwdHeaders http.Header
-		if clientFormat == provider.Format {
+		if clientFormat == eff.Format {
 			fwdHeaders = headers
 		} else if headers != nil {
 			// Forward tracing headers even when translating formats
@@ -538,9 +648,9 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			}
 		}
 		if isStreaming {
-			resp, err = r.client.CallStream(ctx, provider, translatedBody, fwdHeaders)
+			resp, err = r.client.CallStream(ctx, eff, translatedBody, fwdHeaders)
 		} else {
-			resp, err = r.client.Call(ctx, provider, translatedBody, fwdHeaders)
+			resp, err = r.client.Call(ctx, eff, translatedBody, fwdHeaders)
 		}
 		latencyMs := time.Since(start).Milliseconds()
 		r.getInFlight(provider.Name).Add(-1)
@@ -574,7 +684,10 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 			r.mu.Lock()
 			r.lastUsed[provider.Name] = time.Now()
 			r.mu.Unlock()
-			return resp, provider, nil
+			// Return the effective provider (carrying the resolved Format/BaseURL),
+			// not the declared one, so handlers decide response translation based on
+			// the format that was actually used upstream.
+			return resp, eff, nil
 		}
 
 		// Failure: read body (bounded), record failure, try next
@@ -587,6 +700,15 @@ func (r *Router) routeWithDepth(ctx context.Context, planSlug string, body map[s
 
 		latencyMs = time.Since(start).Milliseconds()
 		log.Printf("[ROUTER] FAILURE: plan=%s provider=%s status=%d latency=%dms body=%s", planSlug, provider.Name, resp.StatusCode, latencyMs, errBody)
+
+		// Token-limit / context-window errors mean the request is too large for
+		// this model family. Don't mark the provider unhealthy; return the
+		// upstream response to the client so it can compact or shorten input.
+		if isRequestTooLarge(resp.StatusCode, errBody) {
+			resp.Body = io.NopCloser(strings.NewReader(errBody))
+			return nil, types.ProviderConfig{}, &UpstreamError{Resp: resp, Provider: provider, Body: []byte(errBody)}
+		}
+
 		_ = r.healthTracker.RecordFailure(provider.Name, resp.StatusCode, errBody)
 		r.db.RecordStatAsync(types.StatRecord{
 			Plan:        planSlug,
