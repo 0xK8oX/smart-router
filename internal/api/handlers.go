@@ -51,6 +51,7 @@ func NewServer(r *router.Router, h *health.HealthTracker, d *db.DB, a *Auth, adm
 
 func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/v1/chat/completions", s.handleChatCompletions).Methods(http.MethodPost, http.MethodOptions)
+	r.HandleFunc("/v1/responses", s.handleResponses).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/messages", s.handleMessages).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/messages/count_tokens", s.handleCountTokens).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/models", s.handleListModels).Methods(http.MethodGet, http.MethodOptions)
@@ -121,6 +122,9 @@ func maskPlan(plan types.PlanConfig) types.PlanConfig {
 	}
 	for i, p := range plan.Providers {
 		p.APIKey = types.MaskAPIKey(p.APIKey)
+		// Clear the stored masked_key (a stale carry-over from earlier writes)
+		// so the response only carries the freshly-masked api_key field.
+		p.MaskedKey = ""
 		masked.Providers[i] = p
 	}
 	return masked
@@ -140,7 +144,7 @@ func extractUsage(data []byte, format string) (reqTokens, respTokens int) {
 	if err := json.Unmarshal(data, &usage); err != nil {
 		return 0, 0
 	}
-	if format == "anthropic" {
+	if format == "anthropic" || format == "responses" {
 		return usage.Usage.InputTokens, usage.Usage.OutputTokens
 	}
 	return usage.Usage.PromptTokens, usage.Usage.CompletionTokens
@@ -188,6 +192,20 @@ func extractUsageFromStream(data []byte, format string) (reqTokens, respTokens i
 				}
 				if v, ok := usage["completion_tokens"].(float64); ok {
 					respTokens = int(v)
+				}
+			}
+			continue
+		}
+		// Responses API: usage lives inside {"response":{"usage":{...}}}.
+		if format == "responses" {
+			if resp, ok := eventJSON["response"].(map[string]interface{}); ok {
+				if u, ok := resp["usage"].(map[string]interface{}); ok {
+					if v, ok := u["input_tokens"].(float64); ok {
+						reqTokens = int(v)
+					}
+					if v, ok := u["output_tokens"].(float64); ok {
+						respTokens = int(v)
+					}
 				}
 			}
 		}
@@ -367,6 +385,12 @@ func emitStreamError(w http.ResponseWriter, flusher http.Flusher, clientFormat s
 				"message": err.Error(),
 			},
 		})
+	case "responses":
+		payload, marshalErr = json.Marshal(map[string]interface{}{
+			"type":    "error",
+			"code":    nil,
+			"message": err.Error(),
+		})
 	default:
 		payload, marshalErr = json.Marshal(map[string]interface{}{
 			"error": map[string]interface{}{
@@ -378,9 +402,12 @@ func emitStreamError(w http.ResponseWriter, flusher http.Flusher, clientFormat s
 	if marshalErr != nil {
 		return
 	}
-	if clientFormat == "anthropic" {
+	switch clientFormat {
+	case "anthropic":
 		w.Write([]byte("event: error\ndata: " + string(payload) + "\n\n"))
-	} else {
+	case "responses":
+		w.Write([]byte("event: error\ndata: " + string(payload) + "\n\n"))
+	default:
 		w.Write([]byte("data: " + string(payload) + "\n\n"))
 	}
 	if flusher != nil {
@@ -561,6 +588,23 @@ func (s *Server) handleCompletion(w http.ResponseWriter, r *http.Request, client
 
 	resp, provider, err := s.router.Route(r.Context(), planSlug, body, isStreaming, clientFormat, r.Header, clientKey)
 	if err != nil {
+		if ue, ok := err.(*router.UpstreamError); ok {
+			// Pass through the upstream error response unchanged.
+			resp := ue.Resp
+			defer resp.Body.Close()
+			for k, vv := range resp.Header {
+				if isSensitiveHeader(k) {
+					continue
+				}
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			w.Header().Del("Content-Length")
+			w.WriteHeader(resp.StatusCode)
+			w.Write(ue.Body)
+			return
+		}
 		writeError(w, r, http.StatusServiceUnavailable, err.Error())
 		return
 	}
@@ -630,6 +674,290 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 // routes through the plan, then translates the response back to Anthropic format.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.handleCompletion(w, r, "anthropic")
+}
+
+// handleResponses implements the OpenAI Responses API (POST /v1/responses) for
+// clients like Codex that require it. It converts Responses <-> Chat
+// Completions at the edge and reuses the existing routing + translation
+// pipeline (including tool calls). The upstream call is always non-streaming;
+// when the client requests a stream we synthesize Responses SSE from the
+// buffered response.
+func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
+	body := make(map[string]interface{})
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, r, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	planSlug := PlanSlugFromContext(r.Context())
+	if planSlug == "" {
+		planSlug = resolvePlanFromBody(body)
+	}
+
+	isStreaming := false
+	if st, ok := body["stream"].(bool); ok {
+		isStreaming = st
+	}
+
+	clientKey := ClientKeyFromContext(r.Context())
+	clientKeyMask := types.MaskAPIKey(clientKey)
+
+	if apiKey := APIKeyFromContext(r.Context()); apiKey != nil && len(apiKey.Models) > 0 {
+		requestedModel, _ := body["model"].(string)
+		allowed := false
+		for _, m := range apiKey.Models {
+			if m == requestedModel || m == "*" {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			writeError(w, r, http.StatusForbidden, "model not allowed for this key")
+			return
+		}
+	}
+
+	// Native /v1/responses passthrough: if a provider declares a responses
+	// endpoint, route the raw Responses request body straight to it and skip
+	// the Chat Completions conversion.
+	eff, err := s.router.ResolveProvider(r.Context(), planSlug, body, "responses")
+	if err == nil && eff.Format == "responses" {
+		s.handleResponsesNative(w, r, planSlug, body, isStreaming, clientKey, clientKeyMask)
+		return
+	}
+
+	// Edge conversion: Responses -> Chat Completions.
+	chatBody, err := translation.ResponsesRequestToChat(body)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, "failed to convert responses request")
+		return
+	}
+
+	// Strip plan prefix from model (mirror handleCompletion).
+	if model, ok := chatBody["model"].(string); ok {
+		if strings.HasPrefix(model, "auto-") {
+			chatBody["model"] = "auto"
+		} else if strings.Contains(model, "/") {
+			parts := strings.SplitN(model, "/", 2)
+			if len(parts) == 2 {
+				chatBody["model"] = parts[1]
+			}
+		}
+	}
+
+	if isStreaming {
+		s.streamResponses(w, r, planSlug, chatBody, clientKey, clientKeyMask)
+		return
+	}
+
+	resp, provider, err := s.router.Route(r.Context(), planSlug, chatBody, false, "openai", r.Header, clientKey)
+	if err != nil {
+		if ue, ok := err.(*router.UpstreamError); ok {
+			defer ue.Resp.Body.Close()
+			writeResponsesError(w, ue.Resp.StatusCode, ue.Body)
+			return
+		}
+		writeResponsesError(w, http.StatusServiceUnavailable, []byte(err.Error()))
+		return
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize+1))
+	if err != nil {
+		log.Printf("read response body error: %v", err)
+		writeError(w, r, http.StatusInternalServerError, "failed to read response")
+		return
+	}
+	if int64(len(data)) > maxResponseBodySize {
+		writeError(w, r, http.StatusInternalServerError, "response body too large")
+		return
+	}
+
+	// Router returns the response in provider.Format; normalize to chat-completions.
+	if provider.Format != "openai" {
+		translated, terr := translation.TranslateResponse(data, provider.Format, "openai")
+		if terr != nil {
+			log.Printf("translate response error: %v", terr)
+		} else {
+			data = translated
+		}
+	}
+
+	latencyMs := time.Since(start).Milliseconds()
+	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, "openai", clientKeyMask, chatBody, resp.StatusCode, r.Header.Get("User-Agent"))
+
+	// Edge conversion: Chat Completions -> Responses.
+	responsesBytes, err := translation.ChatCompletionToResponses(data)
+	if err != nil {
+		log.Printf("convert to responses error: %v", err)
+		writeError(w, r, http.StatusInternalServerError, "failed to convert to responses format")
+		return
+	}
+
+	w.Header().Del("Content-Length")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(responsesBytes)
+}
+
+// handleResponsesNative proxies a Responses-format request to a provider that
+// natively supports /v1/responses. When isStreaming is true and the upstream
+// returns SSE, the stream is forwarded unchanged via proxyStream; otherwise the
+// response is read and returned as a buffered passthrough. The two paths share
+// header copying, error handling, and stat recording so a fix to one applies
+// to the other.
+func (s *Server) handleResponsesNative(w http.ResponseWriter, r *http.Request, planSlug string, body map[string]interface{}, isStreaming bool, clientKey, clientKeyMask string) {
+	start := time.Now()
+	if isStreaming {
+		body["stream"] = true
+	}
+	resp, provider, err := s.router.Route(r.Context(), planSlug, body, isStreaming, "responses", r.Header, clientKey)
+	if err != nil {
+		if ue, ok := err.(*router.UpstreamError); ok {
+			defer ue.Resp.Body.Close()
+			writeResponsesError(w, ue.Resp.StatusCode, ue.Body)
+			return
+		}
+		writeResponsesError(w, http.StatusServiceUnavailable, []byte(err.Error()))
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers, filtering out sensitive ones from upstream.
+	for k, vv := range resp.Header {
+		if isSensitiveHeader(k) {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+
+	if isStreaming && translation.IsStreamingResponse(resp.Header) {
+		w.Header().Del("Content-Length")
+		w.Header().Del("Content-Encoding")
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(resp.StatusCode)
+		s.proxyStream(r.Context(), w, resp.Body, planSlug, provider, start, "responses", clientKeyMask, body, resp.StatusCode, r.Header.Get("User-Agent"))
+		return
+	}
+
+	// Buffered passthrough (non-streaming, or streaming-but-upstream-didn't-stream).
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize+1))
+	if err != nil {
+		log.Printf("read response body error: %v", err)
+		writeError(w, r, http.StatusInternalServerError, "failed to read response")
+		return
+	}
+	if int64(len(data)) > maxResponseBodySize {
+		writeError(w, r, http.StatusInternalServerError, "response body too large")
+		return
+	}
+
+	latencyMs := time.Since(start).Milliseconds()
+	recordSuccessStat(s.db, planSlug, provider, latencyMs, false, data, "responses", clientKeyMask, body, resp.StatusCode, r.Header.Get("User-Agent"))
+
+	w.Header().Del("Content-Length")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(data)
+}
+
+// streamResponses handles the streaming path of /v1/responses. It always
+// invokes Route with streaming, then translates the upstream SSE (provider
+// format -> openai chat -> Responses) on the fly so the client sees a true
+// incremental event stream.
+func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request, planSlug string, chatBody map[string]interface{}, clientKey, clientKeyMask string) {
+	start := time.Now()
+	chatBody["stream"] = true
+	resp, provider, err := s.router.Route(r.Context(), planSlug, chatBody, true, "openai", r.Header, clientKey)
+	if err != nil {
+		if ue, ok := err.(*router.UpstreamError); ok {
+			defer ue.Resp.Body.Close()
+			writeResponsesError(w, ue.Resp.StatusCode, ue.Body)
+			return
+		}
+		writeResponsesError(w, http.StatusServiceUnavailable, []byte(err.Error()))
+		return
+	}
+	defer resp.Body.Close()
+
+	if !translation.IsStreamingResponse(resp.Header) {
+		// Upstream didn't actually stream (returned JSON). Fall back to buffered
+		// path: read, translate to chat, convert to Responses, synthesize SSE.
+		log.Printf("responses stream: upstream returned non-SSE; falling back to buffered")
+		data, rerr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize+1))
+		if rerr != nil {
+			writeResponsesError(w, http.StatusInternalServerError, []byte(rerr.Error()))
+			return
+		}
+		if provider.Format != "openai" {
+			if translated, terr := translation.TranslateResponse(data, provider.Format, "openai"); terr == nil {
+				data = translated
+			}
+		}
+		recordSuccessStat(s.db, planSlug, provider, time.Since(start).Milliseconds(), false, data, "openai", clientKeyMask, chatBody, resp.StatusCode, r.Header.Get("User-Agent"))
+		responsesBytes, cerr := translation.ChatCompletionToResponses(data)
+		if cerr != nil {
+			writeResponsesError(w, http.StatusInternalServerError, []byte(cerr.Error()))
+			return
+		}
+		w.Header().Del("Content-Length")
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_ = translation.WriteResponsesSSE(w, responsesBytes)
+		return
+	}
+
+	w.Header().Del("Content-Length")
+	w.Header().Del("Content-Encoding")
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(resp.StatusCode)
+
+	var bodyReader io.Reader = resp.Body
+	if provider.Format != "openai" {
+		bodyReader = translation.SSETranslator(resp.Body, provider.Format, "openai")
+	}
+	bodyReader = translation.ChatSSEToResponses(bodyReader)
+
+	s.proxyStream(r.Context(), w, bodyReader, planSlug, provider, start, "responses", clientKeyMask, chatBody, resp.StatusCode, r.Header.Get("User-Agent"))
+}
+
+// writeResponsesError writes a Responses-style error envelope. If the upstream
+// body is JSON with a message, that message is surfaced.
+func writeResponsesError(w http.ResponseWriter, status int, upstreamBody []byte) {
+	msg := string(upstreamBody)
+	var probe map[string]interface{}
+	if json.Unmarshal(upstreamBody, &probe) == nil {
+		if e, ok := probe["error"].(map[string]interface{}); ok {
+			if m, ok := e["message"].(string); ok && m != "" {
+				msg = m
+			}
+		} else if m, ok := probe["message"].(string); ok && m != "" {
+			msg = m
+		}
+	}
+	payload := map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": msg,
+			"type":    "server_error",
+			"code":    nil,
+		},
+	}
+	w.Header().Del("Content-Length")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(payload)
 }
 
 // handleCountTokens mirrors Anthropic's /v1/messages/count_tokens endpoint.
@@ -894,13 +1222,9 @@ func (s *Server) handleGetPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !adminKeyValid(r.Header.Get("X-Admin-Key"), s.adminKey) {
-		masked := maskPlan(*plan)
-		writeJSON(w, http.StatusOK, masked)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, plan)
+	// Always mask API keys in responses, even to admin callers — the raw key is
+	// never needed for read/display, and returning it would leak plaintext.
+	writeJSON(w, http.StatusOK, maskPlan(*plan))
 }
 
 func (s *Server) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {

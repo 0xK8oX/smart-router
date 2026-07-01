@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2822,7 +2823,9 @@ func TestHandleGetModel_OPTIONS(t *testing.T) {
 	}
 }
 
-func TestHandleGetPlan_AdminUnmasked(t *testing.T) {
+func TestHandleGetPlan_AdminKeyMasked(t *testing.T) {
+	// Even admin callers must never receive the raw (decrypted) API key — it is
+	// not needed for read/display and would leak plaintext provider keys.
 	database := setupTestDB(t)
 	_ = database.SavePlan("test-plan", types.PlanConfig{
 		Providers: []types.ProviderConfig{
@@ -2841,8 +2844,11 @@ func TestHandleGetPlan_AdminUnmasked(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "sk-secret-key") {
-		t.Errorf("expected admin to see unmasked API key, got: %s", rr.Body.String())
+	if strings.Contains(rr.Body.String(), "sk-secret-key") {
+		t.Errorf("admin must NOT see raw API key, got: %s", rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), types.MaskAPIKey("sk-secret-key")) {
+		t.Errorf("expected masked API key %q in response, got: %s", types.MaskAPIKey("sk-secret-key"), rr.Body.String())
 	}
 }
 
@@ -2955,5 +2961,278 @@ func TestHandleCountTokens_OPTIONS(t *testing.T) {
 
 	if rr.Code != http.StatusNoContent {
 		t.Errorf("expected 204, got %d", rr.Code)
+	}
+}
+
+// chatCompletionBody is a fixed OpenAI chat completion the mock upstream returns.
+const chatCompletionText = `{"id":"chatcmpl-1","object":"chat.completion","model":"glm-5.2","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"Hello from upstream"}}],"usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}}`
+
+func TestHandleResponses_NonStreaming(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, chatCompletionText)
+	}))
+	defer upstream.Close()
+
+	database := setupTestDB(t)
+	_ = database.SavePlan("testplan", types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "stub", BaseURL: upstream.URL, Format: "openai", APIKey: "sk-test", Timeout: 30},
+		},
+	})
+	_, router := setupTestServer(t, database)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"auto-testplan","input":"hi"}`))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"object":"response"`) {
+		t.Errorf("expected Responses object, got %s", body)
+	}
+	if !strings.Contains(body, "Hello from upstream") {
+		t.Errorf("expected upstream text in output, got %s", body)
+	}
+}
+
+func TestHandleResponses_AnthropicProvider(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"msg_1","type":"message","role":"assistant","model":"glm","content":[{"type":"text","text":"anthropic reply"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":4}}`)
+	}))
+	defer upstream.Close()
+
+	database := setupTestDB(t)
+	_ = database.SavePlan("anthplan", types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "stub", BaseURL: upstream.URL, Format: "anthropic", APIKey: "sk-test", Timeout: 30},
+		},
+	})
+	_, router := setupTestServer(t, database)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"auto-anthplan","input":"hi"}`))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "anthropic reply") {
+		t.Errorf("expected translated text, got %s", body)
+	}
+	if !strings.Contains(body, `"input_tokens":3`) {
+		t.Errorf("expected usage mapped from anthropic, got %s", body)
+	}
+}
+
+func TestHandleResponses_ToolCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"chatcmpl-2","object":"chat.completion","model":"glm","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_9","type":"function","function":{"name":"shell","arguments":"{\"cmd\":\"ls\"}"}}]}}],"usage":{"prompt_tokens":5,"completion_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	database := setupTestDB(t)
+	_ = database.SavePlan("toolplan", types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "stub", BaseURL: upstream.URL, Format: "openai", APIKey: "sk-test", Timeout: 30},
+		},
+	})
+	_, router := setupTestServer(t, database)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"auto-toolplan","input":[{"type":"message","role":"user","content":"list files"}],"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]}`))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"type":"function_call"`) {
+		t.Errorf("expected function_call output item, got %s", body)
+	}
+	if !strings.Contains(body, `"name":"shell"`) || !strings.Contains(body, `"call_id":"call_9"`) {
+		t.Errorf("expected shell call_id round-trip, got %s", body)
+	}
+}
+
+func TestHandleResponses_Streaming(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, chatCompletionText)
+	}))
+	defer upstream.Close()
+
+	database := setupTestDB(t)
+	_ = database.SavePlan("strmplan", types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "stub", BaseURL: upstream.URL, Format: "openai", APIKey: "sk-test", Timeout: 30},
+		},
+	})
+	_, router := setupTestServer(t, database)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"auto-strmplan","input":"hi","stream":true}`))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Errorf("expected event-stream Content-Type, got %q", got)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "event: response.created") {
+		t.Errorf("missing response.created:\n%s", body)
+	}
+	if !strings.Contains(body, "event: response.completed") {
+		t.Errorf("missing response.completed:\n%s", body)
+	}
+	if !strings.Contains(body, "Hello from upstream") {
+		t.Errorf("expected streamed text, got %s", body)
+	}
+}
+
+func TestHandleResponses_AuthRequired(t *testing.T) {
+	// /v1/responses must NOT be in the auth skip-list: a request without a key
+	// must be rejected with 401.
+	database := setupTestDB(t)
+	a := NewAuth(database, auth.NewRateLimiter())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"auto-x","input":"hi"}`))
+	rr := httptest.NewRecorder()
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	a.Middleware(next).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 (auth required for /v1/responses), got %d", rr.Code)
+	}
+}
+
+func TestHandleResponses_NativePassthrough(t *testing.T) {
+	var receivedPath string
+	var receivedBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":"resp_native","object":"response","model":"MiniMax-M3","output":[{"type":"message","content":[{"type":"output_text","text":"native ok"}]}]}`)
+	}))
+	defer upstream.Close()
+
+	database := setupTestDB(t)
+	_ = database.SavePlan("nativeplan", types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "stub", BaseURL: upstream.URL, Format: "anthropic", APIKey: "sk-test", Timeout: 30,
+				Endpoints: map[string]string{"responses": upstream.URL}},
+		},
+	})
+	_, router := setupTestServer(t, database)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"auto-nativeplan","input":"hi"}`))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if receivedPath != "/v1/responses" {
+		t.Errorf("expected upstream /v1/responses, got %s", receivedPath)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"object":"response"`) {
+		t.Errorf("expected raw Responses object, got %s", body)
+	}
+	if !strings.Contains(body, "native ok") {
+		t.Errorf("expected upstream text, got %s", body)
+	}
+	// Verify the request body was passed through without conversion to messages.
+	var sent map[string]interface{}
+	if err := json.Unmarshal(receivedBody, &sent); err != nil {
+		t.Fatalf("decode upstream body: %v", err)
+	}
+	if sent["input"] != "hi" {
+		t.Errorf("expected raw input field, got %v", sent)
+	}
+	if _, ok := sent["messages"]; ok {
+		t.Errorf("expected NO messages field (no conversion), got %v", sent)
+	}
+}
+
+func TestHandleResponses_NativePassthrough_Streaming(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("expected /v1/responses, got %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "event: response.created\ndata: {\"id\":\"x\"}\n\nevent: response.output_text.delta\ndata: {\"delta\":\"native stream\"}\n\nevent: response.completed\ndata: {}\n\n")
+	}))
+	defer upstream.Close()
+
+	database := setupTestDB(t)
+	_ = database.SavePlan("nativestrm", types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "stub", BaseURL: upstream.URL, Format: "anthropic", APIKey: "sk-test", Timeout: 30,
+				Endpoints: map[string]string{"responses": upstream.URL}},
+		},
+	})
+	_, router := setupTestServer(t, database)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"auto-nativestrm","input":"hi","stream":true}`))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Errorf("expected event-stream, got %q", got)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "event: response.output_text.delta") {
+		t.Errorf("expected raw responses SSE, got %s", body)
+	}
+	if !strings.Contains(body, "native stream") {
+		t.Errorf("expected streamed text, got %s", body)
+	}
+}
+
+func TestHandleResponses_LegacyFallback_NoResponsesEndpoint(t *testing.T) {
+	// Provider has no responses endpoint, so the legacy Chat Completions path is used.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, chatCompletionText)
+	}))
+	defer upstream.Close()
+
+	database := setupTestDB(t)
+	_ = database.SavePlan("legplan", types.PlanConfig{
+		Providers: []types.ProviderConfig{
+			{Name: "stub", BaseURL: upstream.URL, Format: "openai", APIKey: "sk-test", Timeout: 30},
+		},
+	})
+	_, router := setupTestServer(t, database)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"auto-legplan","input":"hi"}`))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"object":"response"`) {
+		t.Errorf("expected Responses object after legacy conversion, got %s", body)
 	}
 }

@@ -58,7 +58,7 @@ func TestCallProvider(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, err := client.Call(context.Background(),provider, body, nil)
+	resp, err := client.Call(context.Background(), provider, body, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestCallProviderAnthropicHeader(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, err := client.Call(context.Background(),provider, body, nil)
+	resp, err := client.Call(context.Background(), provider, body, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestDoRequest_KimiCodingHeaders(t *testing.T) {
 	}
 	body := map[string]interface{}{"model": "kimi-coder"}
 
-	resp, err := client.Call(context.Background(),provider, body, nil)
+	resp, err := client.Call(context.Background(), provider, body, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestDoRequest_HeaderForwarding(t *testing.T) {
 	headers := http.Header{}
 	headers.Set("X-Custom-Header", "custom-value")
 
-	resp, err := client.Call(context.Background(),provider, body, headers)
+	resp, err := client.Call(context.Background(), provider, body, headers)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestDoRequest_DefaultAuthHeader(t *testing.T) {
 	}
 	body := map[string]interface{}{"model": "model-x"}
 
-	resp, err := client.Call(context.Background(),provider, body, nil)
+	resp, err := client.Call(context.Background(), provider, body, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestDoRequest_AnthropicFormatNonNative(t *testing.T) {
 	}
 	body := map[string]interface{}{"model": "claude-3-opus"}
 
-	resp, err := client.Call(context.Background(),provider, body, nil)
+	resp, err := client.Call(context.Background(), provider, body, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -306,7 +306,7 @@ func TestCallStream(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "hello"}},
 	}
 
-	resp, err := client.CallStream(context.Background(),provider, body, nil)
+	resp, err := client.CallStream(context.Background(), provider, body, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -350,7 +350,7 @@ func TestDoRequest_ContentLengthStrippedWhenBodyChanges(t *testing.T) {
 		"messages": []map[string]string{{"role": "user", "content": "this is a much longer message that exceeds forty-two bytes easily"}},
 	}
 
-	resp, err := client.Call(context.Background(),provider, body, headers)
+	resp, err := client.Call(context.Background(), provider, body, headers)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestDoRequest_HopByHopHeadersStripped(t *testing.T) {
 
 	body := map[string]interface{}{"model": "gpt-4"}
 
-	resp, err := client.Call(context.Background(),provider, body, headers)
+	resp, err := client.Call(context.Background(), provider, body, headers)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -442,7 +442,7 @@ func TestDoRequest_AuthHeaderNotForwarded(t *testing.T) {
 
 	body := map[string]interface{}{"model": "gpt-4"}
 
-	resp, err := client.Call(context.Background(),provider, body, headers)
+	resp, err := client.Call(context.Background(), provider, body, headers)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -454,5 +454,79 @@ func TestDoRequest_AuthHeaderNotForwarded(t *testing.T) {
 	}
 	if gotAuth != "Bearer sk-provider-key" {
 		t.Errorf("expected provider auth header, got %q", gotAuth)
+	}
+}
+
+func TestBuildEndpoint_Responses(t *testing.T) {
+	tests := []struct {
+		baseURL string
+		format  string
+		want    string
+	}{
+		{"https://api.example.com/v1", "responses", "https://api.example.com/v1/responses"},
+		{"https://api.example.com/", "responses", "https://api.example.com/v1/responses"},
+		{"https://api.example.com", "responses", "https://api.example.com/v1/responses"},
+		{"https://api.example.com/v1", "openai", "https://api.example.com/v1/chat/completions"},
+		{"https://api.example.com/v1", "anthropic", "https://api.example.com/v1/messages"},
+	}
+	for _, tc := range tests {
+		got := buildEndpoint(tc.baseURL, tc.format)
+		if got != tc.want {
+			t.Errorf("buildEndpoint(%q, %q) = %q, want %q", tc.baseURL, tc.format, got, tc.want)
+		}
+	}
+}
+
+func TestBuildEndpoint_FullURLPassthrough(t *testing.T) {
+	// A URL that already ends in a known API path is returned verbatim, so
+	// providers with non-OpenAI path conventions (e.g. bigmodel's
+	// /api/paas/v4/chat/completions) can declare their exact endpoint.
+	tests := []struct {
+		baseURL string
+		format  string
+		want    string
+	}{
+		{"https://open.bigmodel.cn/api/paas/v4/chat/completions", "openai", "https://open.bigmodel.cn/api/paas/v4/chat/completions"},
+		{"https://open.bigmodel.cn/api/paas/v4/chat/completions/", "openai", "https://open.bigmodel.cn/api/paas/v4/chat/completions"},
+		{"https://host.example/some/path/messages", "anthropic", "https://host.example/some/path/messages"},
+		{"https://host.example/some/path/responses", "responses", "https://host.example/some/path/responses"},
+	}
+	for _, tc := range tests {
+		got := buildEndpoint(tc.baseURL, tc.format)
+		if got != tc.want {
+			t.Errorf("buildEndpoint(%q, %q) = %q, want %q", tc.baseURL, tc.format, got, tc.want)
+		}
+	}
+}
+
+func TestCallProvider_Responses(t *testing.T) {
+	var receivedPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"resp_test","object":"response"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient()
+	provider := types.ProviderConfig{
+		Name:    "native",
+		BaseURL: server.URL,
+		Model:   "m",
+		Format:  "responses",
+		Timeout: 5,
+		APIKey:  "sk-test",
+	}
+	body := map[string]interface{}{"model": "m", "input": "hi"}
+
+	resp, err := client.Call(context.Background(), provider, body, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if receivedPath != "/v1/responses" {
+		t.Errorf("expected path /v1/responses, got %s", receivedPath)
 	}
 }
