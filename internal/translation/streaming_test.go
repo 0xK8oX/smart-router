@@ -236,13 +236,24 @@ data: [DONE]
 	out := OpenAIToAnthropicStream(strings.NewReader(input))
 	lines := readAllLines(t, out)
 
+	// Collect (type, index) for every block event so we can assert there are no
+	// index collisions and that start/stop indices line up.
+	type blockEvent struct {
+		typ   string
+		index float64
+	}
+	var blockEvents []blockEvent
 	var foundThinking string
 	for _, line := range lines {
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
 		event := parseDataLine(t, line)
-		if event["type"] == "content_block_delta" {
+		switch event["type"] {
+		case "content_block_start", "content_block_stop":
+			idx, _ := event["index"].(float64)
+			blockEvents = append(blockEvents, blockEvent{event["type"].(string), idx})
+		case "content_block_delta":
 			delta, _ := event["delta"].(map[string]interface{})
 			if thinking, ok := delta["thinking"].(string); ok {
 				foundThinking = thinking
@@ -251,6 +262,18 @@ data: [DONE]
 	}
 	if foundThinking != "Let me think..." {
 		t.Errorf("expected thinking='Let me think...', got %q", foundThinking)
+	}
+
+	// No two content_block_start events may share the same index (protocol
+	// violation that makes strict clients disconnect).
+	started := map[float64]bool{}
+	for _, e := range blockEvents {
+		if e.typ == "content_block_start" {
+			if started[e.index] {
+				t.Errorf("duplicate content_block_start at index %v", e.index)
+			}
+			started[e.index] = true
+		}
 	}
 }
 

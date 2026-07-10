@@ -145,7 +145,7 @@ func OpenAIToAnthropicStream(reader io.Reader) io.Reader {
 				textBlockStarted = false
 			}
 			if thinkingBlockStarted {
-				emitContentBlockStop(0)
+				emitContentBlockStop(1)
 				thinkingBlockStarted = false
 			}
 			for idx := range toolCalls {
@@ -315,17 +315,24 @@ func OpenAIToAnthropicStream(reader io.Reader) io.Reader {
 				})
 			}
 
-			// Handle reasoning
-			if reasoning, ok := delta["reasoning"].(string); ok && reasoning != "" {
+			// Handle reasoning (OpenAI `reasoning` or llama.cpp `reasoning_content`).
+			// Thinking gets its own block index (1) so it never collides with the
+			// text block at index 0 — two content_block_start events at the same
+			// index is a protocol violation that makes strict clients disconnect.
+			reasoning, _ := delta["reasoning"].(string)
+			if reasoning == "" {
+				reasoning, _ = delta["reasoning_content"].(string)
+			}
+			if reasoning != "" {
 				emitMessageStart()
 				if !thinkingBlockStarted {
-					emitContentBlockStart(0, "thinking", map[string]interface{}{
+					emitContentBlockStart(1, "thinking", map[string]interface{}{
 						"type":     "thinking",
 						"thinking": "",
 					})
 					thinkingBlockStarted = true
 				}
-				emitContentBlockDelta(0, map[string]interface{}{
+				emitContentBlockDelta(1, map[string]interface{}{
 					"type":     "thinking_delta",
 					"thinking": reasoning,
 				})
